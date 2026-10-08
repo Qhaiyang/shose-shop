@@ -12,6 +12,13 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // E2E 测试用的独立构建目录（见 next.config.ts 的 distDir）。
+    // 里面全是 Turbopack 编译出来的产物，不 ignore 的话
+    // `npm run lint` 会去检查这些生成代码，报出几千条无意义的告警
+    ".next-e2e/**",
+    // Playwright 的产物（失败截图、trace、HTML 报告）
+    "test-results/**",
+    "playwright-report/**",
   ]),
 ]);
 

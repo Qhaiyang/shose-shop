@@ -1,0 +1,558 @@
+// ============================================================================
+// 鞋类电商 —— 数据模型
+//
+// 【关于枚举字段为什么还是 String】
+// 之前用 SQLite，它不支持 enum，所以订单状态、用户角色这些字段只能存
+// String，取值约束靠 TypeScript 层保证（见 src/lib/constants.ts）。
+// 换成 PostgreSQL 之后 enum 是可用的，但**这次迁移刻意不改**：
+//   状态机是一份白名单，它的唯一事实来源是 src/lib/constants.ts 里的
+//   ORDER_STATUS_TRANSITIONS（三层测试都在钉它）。如果同时在数据库里
+//   建一套 enum，就有两份定义，加一个状态要改两处 ——
+//   而漏改数据库那份的症状是「本地测试全绿、生产插入报错」。
+//   这是迁移该做的事之外的事，不该混在一起。
+//
+// 【关于 Product.images 为什么还是 JSON 字符串】
+// 同理：SQLite 不支持标量数组，所以用 String 存 JSON。PostgreSQL 有
+// text[]，改回数组意味着所有读写 images 的地方都要跟着改。
+// 同样是一次独立的重构，不混在「换数据库」这一步里。
+// 两件事都记在 README 的架构决策里，作为已知的、有意留下的取舍。
+//
+// 【连接串在哪】
+// Prisma 7 起，datasource 块里不再写 url（老版本的 url / directUrl
+// 都没有了），连接串挪到了 prisma7.config.ts 的 datasource.url ——
+// 那是给 Prisma CLI（migrate / studio / seed）用的。
+// 应用运行时用的是 src/lib/prisma.ts 里的 driver adapter。
+//
+// 【金额】所有金额字段都用 Int，单位是「分」。
+//   例：¥899.00 存成 89900。
+//   不要用 Float 存钱 —— 0.1 + 0.2 !== 0.3，浮点误差会累积成对不上账。
+// ============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 用户
+// ---------------------------------------------------------------------------
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String // bcrypt 哈希后的密码，绝不存明文
+  name      String
+  // "USER" | "ADMIN"  —— SQLite 无 enum，靠 TS 层约束
+  role      String   @default("USER")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cartItems  CartItem[]
+  orders     Order[]
+  reviews    Review[]
+  favorites  Favorite[]
+  userCoupons UserCoupon[]
+  refundRequests RefundRequest[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// 商品 SPU（Standard Product Unit）
+// 只描述「这是一款什么鞋」，不含尺码/颜色/价格/库存 —— 那些在 Sku 上
+// ---------------------------------------------------------------------------
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  description String
+  category    String
+  // JSON 字符串数组，如 '["/shoes/a-1.jpg","/shoes/a-2.jpg"]'
+  // 读的时候用 parseImages() 解析（见 src/lib/utils.ts）
+  images      String   @default("[]")
+  // 后台「下架」用它，而不是物理删除 —— 已下单的商品不能凭空消失
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  skus      Sku[]
+  reviews   Review[]
+  favorites Favorite[]
+
+  @@index([category])
+  @@map("products")
+}
+
+// ---------------------------------------------------------------------------
+// 商品 SKU（Stock Keeping Unit）—— 真正被买卖、被扣库存的单位
+// 「42 码 / 黑色」就是一个 SKU
+// ---------------------------------------------------------------------------
+model Sku {
+  id        String @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  size      String // 尺码，如 "42"
+  color     String // 颜色，如 "黑色"
+  stock     Int    @default(0) // 可售库存
+  price     Int // 单位：分
+  skuCode   String @unique // 如 "SHOE-001-42-BLK"，便于人工对账
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cartItems  CartItem[]
+  orderItems OrderItem[]
+
+  // 同一款鞋下，「尺码 + 颜色」必须唯一，不能出现两个 42 码黑色
+  @@unique([productId, size, color])
+  @@index([productId])
+  @@map("skus")
+}
+
+// ---------------------------------------------------------------------------
+// 购物车条目
+// 未登录时购物车存在浏览器 localStorage；登录后合并到这张表
+// ---------------------------------------------------------------------------
+model CartItem {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skuId  String
+  // 商品/SKU 被删除时，购物车里的对应条目一并清掉
+  sku    Sku    @relation(fields: [skuId], references: [id], onDelete: Cascade)
+
+  quantity Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 关键约束：一个用户 + 一个 SKU 只能有一行。
+  // 重复加购走 UPSERT 把 quantity 累加，而不是插入新行 —— 这样数据库层面
+  // 就不可能存在「同一个 SKU 两行」的脏数据（第 4 步会用到）
+  @@unique([userId, skuId])
+  @@index([userId])
+  @@map("cart_items")
+}
+
+// ---------------------------------------------------------------------------
+// 订单
+// ---------------------------------------------------------------------------
+model Order {
+  id      String @id @default(cuid())
+  orderNo String @unique // 人类可读单号，如 "20260929-8F3A2C"，给用户看
+  userId  String
+  user    User   @relation(fields: [userId], references: [id])
+
+  // "PENDING_PAYMENT" | "PAID" | "SHIPPED" | "COMPLETED" | "CANCELLED"
+  // "REFUNDING" | "REFUNDED"
+  status String @default("PENDING_PAYMENT")
+
+  // 单位：分，下单瞬间算好并冻结。
+  //
+  // 【这里存的是「实付」，不是「原价」】
+  // 用了优惠券之后 totalAmount = 商品原价合计 - discountAmount。
+  // 为什么不让 totalAmount 继续表示原价、另存一个 payable？因为
+  // 后台「今日销售额」是 SUM(totalAmount) 算的（见 getAdminOrderStats），
+  // 它要的是「今天真收了多少钱」。如果 totalAmount 记原价，
+  // 那笔优惠就得在报表里被减第二次，或者报表直接虚高。
+  // 原价随时可以由订单项快照重新加出来（每项 price × quantity），
+  // 实付却是「少一分钱用户就要投诉」的那个数 —— 该冻结的是它。
+  totalAmount Int
+
+  // 用了哪张券、减了多少钱（分）。没用券时 discountAmount 为 0、couponId 为 NULL。
+  //
+  // 【为什么这里是「引用」而不是像订单项那样存快照】
+  // 优惠券是平台发给自己的东西，不是买家买的商品，改个名字/停用不该让
+  // 历史订单显示不出来。所以 onDelete: SetNull —— 券被删了订单还在，
+  // 只是「用了哪张券」这一格变成空。真正不可变的那部分（减了多少钱）
+  // 已经冻结在 discountAmount 里了，报表不受影响
+  couponId       String?
+  coupon         Coupon? @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  discountAmount Int     @default(0)
+  address        String
+  phone          String
+
+  // 买家备注，选填：从结算页带过来，发货前还能在订单详情页改。
+  //
+  // 【为什么这里不是快照，而 OrderItem 里全是快照】
+  // 订单项存快照，是因为「当时买的是什么、多少钱」必须不可变 ——
+  // 那是交易凭证。备注不一样，它是买家自己留的一句话（「请工作日送」
+  // 「放门口快递柜」），本来就可能想补充或写错。
+  //
+  // 但它也不是随便改：一旦发货，货已经在路上、面单也打了，
+  // 再改备注只会让订单和现实对不上。所以「能不能改」交给状态机管，
+  // 见 src/lib/constants.ts 的 isNoteEditable
+  note String?
+
+  createdAt DateTime  @default(now())
+  // 下单时写入 = createdAt + 15 分钟。
+  // 存成字段而不是每次查询时现算 createdAt + 15min，是为了能走索引 ——
+  // 第 8 步的超时扫描是 WHERE status='PENDING_PAYMENT' AND expiresAt < now()，
+  // 没有这个字段就只能全表扫描 + 逐行算时间
+  expiresAt   DateTime
+  paidAt      DateTime?
+  shippedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  // 退款到账时间。和上面几个时间戳同一个套路：状态机每走一步盖一个时间戳，
+  // 订单详情页的时间线直接读字段，不用去 join RefundRequest
+  refundedAt  DateTime?
+
+  items OrderItem[]
+  // 这一单核销掉的那张券（没用券就是空数组）。
+  // 和上面 coupon 的关系是一对一的两头：coupon 是「用的哪张券」，
+  // 这里是「哪张持有记录被这一单核销了」—— 取消订单时要靠它把券退回去
+  usedCoupons UserCoupon[]
+
+  // 这张订单的退款申请历史（可能有多条：被拒之后还能再申请）
+  refunds RefundRequest[]
+
+  @@index([userId])
+  @@index([status, expiresAt]) // 超时扫描专用索引
+  @@map("orders")
+}
+
+// ---------------------------------------------------------------------------
+// 订单条目 —— 注意这里是「快照」而不是「引用」
+//
+// 为什么要把商品名/尺码/颜色冗余存一份？
+// 因为订单是历史凭证，必须不可变。如果只存 skuId，那么管理员一旦改了价格、
+// 改了商品名、甚至下架了这款鞋，用户翻看三个月前的订单就会看到错误的信息。
+// 所以下单那一刻把关键信息「拍照」存下来。
+// 价格尤其重要：price 存的是下单时的成交价，之后 SKU 调价不影响历史订单。
+// ---------------------------------------------------------------------------
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // 可以为空：SKU 被物理删除后置为 NULL，但订单条目本身保留可读
+  skuId String?
+  sku   Sku?   @relation(fields: [skuId], references: [id], onDelete: SetNull)
+
+  // ---- 下单时的快照 ----
+  productName String
+  size        String
+  color       String
+  price       Int // 成交单价（分）
+
+  quantity Int
+
+  skuCode String? // 下单时的 SKU 货号（SKU 被删后仍可追溯）
+
+  // 这一行被评价过的话，评价挂在这里（一个订单项最多一条，见 Review）
+  review Review?
+
+  @@index([orderId])
+  @@index([skuId])
+  @@map("order_items")
+}
+
+// ---------------------------------------------------------------------------
+// 商品评价
+//
+// 【谁能评价：只有「已完成」订单的买家】
+// 这条规则不是靠前端藏按钮实现的 —— 按钮藏起来只是体验，真正的门在
+// src/app/actions/review.ts 里：提交时重新查一遍这张订单项所属的订单，
+// 确认「是这个人买的」且「状态是 COMPLETED」才允许写入。
+//
+// 【为什么用 orderItemId 而不是 (userId, productId) 判重】
+// 同一个用户可能分三次买同一款鞋，理应能评价三次（每次一双）。
+// 用 (userId, productId) 做唯一约束会把后两次挡掉。
+// 而 orderItemId @unique 表达的是业务原话：「一单里的这一件，评价一次」。
+// 反过来它也顺带堵死了一个漏洞：不能拿一条订单项反复刷评价。
+//
+// 【isDeleted 是软删除】
+// 违规内容下架，但行要留着：
+//   1. 管理员能复查自己删过什么
+//   2. orderItemId 的唯一约束仍然占着位 —— 被删掉的评价不会被同一件商品
+//      再次提交，用户在订单页看到的仍然是「已评价」
+// 真删行的话这两条都会破功，所以宁可留个 isDeleted 标记。
+// ---------------------------------------------------------------------------
+model Review {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // 评价挂在商品上（详情页按它查），而不是挂在 SKU 上 ——
+  // 买 42 码和买 43 码的体验是同一款鞋的体验，不该分成两堆
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // 这条评价是哪一单买出来的。唯一约束 = 「一件商品只能评一次」
+  orderItemId String    @unique
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  // 1~5 星。SQLite 没有 enum 也没有 CHECK，范围靠 src/lib/schemas.ts 的
+  // reviewSchema 在写入前卡住
+  rating  Int
+  content String
+  // 图片路径数组。和 Product.images 同一个原因：SQLite 不支持标量数组，
+  // 只能存 JSON 字符串，读的时候用 parseImages() 解析
+  images String @default("[]")
+
+  isDeleted Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  // 详情页的查询是「某商品的未删除评价，按时间倒序」
+  @@index([productId, isDeleted, createdAt])
+  @@index([userId])
+  @@map("reviews")
+}
+
+// ---------------------------------------------------------------------------
+// 尺码建议映射表
+//
+// 「脚长 → 建议尺码」的对照，按分类维护（跑步鞋 / 篮球鞋 的鞋楦不同，
+// 同一脚长可能建议不同尺码）。详情页的「尺码助手」按分类查这张表。
+//
+// footLengthMin / footLengthMax 用 Float 存 cm（如 25.75、26.25）。
+// 【为什么这里可以用浮点，而金额不行】
+// 金额要的是「加起来分毫不差」，浮点误差会累积成对不上账；脚长是
+// 一个物理测量值，只做「在不在这个区间内」的比较，不参与累加，
+// 而且 0.25 的步长在 IEEE 754 里是精确表示的（0.25 = 2^-2），没有误差。
+//
+// 区间约定是半开区间 [footLengthMin, footLengthMax)：脚长 26.0 落进
+// 尺码 42 的 [25.75, 26.25)，而 26.25 恰好落进下一码 —— 边界不会两码都命中。
+// ---------------------------------------------------------------------------
+model SizeGuide {
+  id            String   @id @default(cuid())
+  category      String
+  footLengthMin Float
+  footLengthMax Float
+  suggestedSize String // 建议尺码，如 "42"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 同一分类下，一个尺码只对应一段脚长区间 —— 种子脚本靠它做幂等 upsert
+  @@unique([category, suggestedSize])
+  @@index([category])
+  @@map("size_guides")
+}
+
+// ---------------------------------------------------------------------------
+// 商品收藏
+//
+// 【和购物车最大的区别：这里没有 localStorage 那一套】
+// 购物车必须支持游客 —— 拦着人不让加购就没人能买东西了。收藏不是：
+// 它是一份「账号资产」，登录之后收藏夹在哪台设备上都在。
+// 所以这张表是收藏的唯一存储，不存在「本地一份、数据库一份、登录时合并」
+// 的问题，也就不需要 CartItem 那套 upsert + increment 的合并逻辑。
+//
+// 【为什么收藏挂在 Product 上，而不是 Sku】
+// 用户想收藏的是「这款鞋」，不是「42 码黑色那一双」——
+// 和评价同一个道理（见 Review.productId 的注释）。
+// 尺码颜色是买的时候才决定的，收藏的时候还没定。
+//
+// 【为什么 @@unique([userId, productId]) 而不是用 id 判重】
+// 和 CartItem 的 @@unique([userId, skuId]) 是同一个套路：
+// 约束放在数据库上，「同一个人收藏同一款鞋两遍」在物理上就不可能发生。
+// 应用层于是可以写幂等的 add（重复收藏 = 什么都不做），
+// 不需要「先查有没有、再决定插不插」——那种写法在并发下会插出两行。
+//
+// 【商品被删掉怎么办】
+// onDelete: Cascade —— 商品物理删除时收藏记录一并消失。
+// 注意用「下架」（isActive = false）不会删行，收藏记录还在，
+// 只是收藏列表里会把它挑出来单独说明（见 src/lib/favorites-db.ts）。
+// ---------------------------------------------------------------------------
+model Favorite {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  // 一个人对一款鞋只能有一条收藏记录
+  @@unique([userId, productId])
+  // 收藏列表是「我的收藏，按收藏时间倒序」——刚好是这个索引的顺序
+  @@index([userId, createdAt])
+  @@map("favorites")
+}
+
+// ---------------------------------------------------------------------------
+// 优惠券（券的「定义」）
+//
+// 注意这里是**模板**，不是「某个用户拥有的券」。谁领了券记在 UserCoupon 里。
+// 分成两张表是因为两边是一对多：一张「满 800 减 100」会被几百个人领，
+// 券的规则（减多少、什么时候过期）只该写一份。
+//
+// 【金额一律是「分】value / minSpend / maxDiscount 都不例外
+// 和商品价格同一个理由：0.1 + 0.2 !== 0.3。
+//
+// 【为什么 usedCount 是一个计数器，而不是「数一下有多少个已用的 UserCoupon」】
+// 数出来当然更「不容易不一致」，但它做不到拦截。要防「同一张券并发下单
+// 10 次不超卖」，必须在**同一句 SQL 里**既判断又扣减：
+//     UPDATE coupons SET usedCount = usedCount + 1
+//      WHERE id = ? AND usedCount < totalLimit
+// 影响行数为 0 就是「券被抢完了」，抛错回滚。计数器的意义就在这里 ——
+// 它让「判断 + 扣减」是一个原子操作。反过来，如果每次都去 COUNT(*)，
+// 判断和插入之间隔着一条缝，10 个并发请求会一起看到「还有 1 张」。
+// ---------------------------------------------------------------------------
+model Coupon {
+  id   String @id @default(cuid())
+  code String @unique // 券码，给用户看也用来在后台搜
+
+  // "FIXED" | "PERCENT" —— SQLite 无 enum，靠 TS 层约束（见 src/lib/constants.ts）
+  //
+  // FIXED   ：value 是减免的金额（分），如 10000 = 减 100 元
+  // PERCENT ：value 是「折扣百分比」，1 ~ 99，如 10 表示「9 折」（减 10%）
+  //
+  // 【为什么 PERCENT 的 value 是「减掉的百分比」而不是「折扣率」】
+  // 用户嘴里说的「9 折」是折扣率 0.9，「满 100 减 10%」才是计算式。
+  // 存折扣率的话得存小数（0.9），而本项目一律不用 Float 存钱相关的东西；
+  // 而且「减多少」这个方向是能和 FIXED 统一的 —— 两种券的 value
+  // 在计算里都是「要减掉的量」，只是单位不同（分 / 百分比）。
+  // 界面上的「9 折」由 src/lib/coupons.ts 的 couponLabel 算出来给人看
+  type String
+
+  value Int
+
+  // 门槛：订单商品原价合计（不含优惠）达到这个数才能用。0 表示无门槛
+  minSpend Int @default(0)
+
+  // 封顶：只在 PERCENT 时必填 —— 9 折券不封顶的话，买台一万块的机器就减一千。
+  // FIXED 不需要它（减 100 就是减 100，本来就封死了），所以是可空
+  maxDiscount Int?
+
+  startAt DateTime
+  endAt   DateTime
+
+  // 总量：一张券最多被用多少次。usedCount 是已用次数，见上方注释
+  totalLimit Int
+  usedCount  Int @default(0)
+
+  // 每人限领几张。注意**不是**唯一约束 —— 允许同一个人领多张，
+  // 到下单时再校验总用量。取 1 就退化成「每人一张」
+  perUserLimit Int @default(1)
+
+  // 停用开关：下架一张券用这个，而不是删掉它。
+  // 删掉会连带把历史订单的 couponId 置空（onDelete: SetNull），
+  // 「这单用了哪张券」就查不到了 —— 停用既挡住了新单，又留住了痕迹
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userCoupons UserCoupon[]
+  orders      Order[]
+
+  @@index([isActive, startAt, endAt]) // 领券列表：筛「启用的、在有效期内的」
+  @@map("coupons")
+}
+
+// ---------------------------------------------------------------------------
+// 用户持有的券（券的「实例」）
+//
+// 【为什么 (userId, couponId) 不唯一】
+// 需求里明确说了「允许领多张」—— 因为券有 perUserLimit，领几张是**能配的**。
+// 如果这里加了 @@unique([userId, couponId])，那一个人就永远只能有一张，
+// perUserLimit 设成 3 也没意义了。所以「领了几张」靠 count(*) 数，
+// 「还能不能领」在 claimCoupon 里判断。
+//
+// 【为什么 orderId 是唯一的】
+// 一张券在一次下单里只能核销一次。@unique 是数据库层面的兜底 ——
+// 应用层的「usedAt 为空才能用」已经把重复用券挡住了，
+// 加上这个约束是防止将来有人写个新入口忘了判断。
+//
+// 【为什么 usedAt 和 orderId 分成两个字段，而不是只留 orderId】
+// 「已用」和「作废」不是一回事：订单取消时要退回券，是「把 usedAt 清空、
+// orderId 置空」；而订单正常完成后它就一直留着。分成两个字段才能表达
+// 「这张券被哪个订单核销了」这个事实，光看 orderId 也够，但把时间戳
+// 单独留一份，列表页要按「使用时间」排序/展示时不用再 join 订单表。
+// ---------------------------------------------------------------------------
+model UserCoupon {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  couponId String
+  // Cascade：券的定义被物理删掉时，持有记录一并消失。
+  // （正常流程里券只该被「停用」，删除只在开发/测试时发生）
+  coupon   Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+
+  // 什么时候领的 —— 领券列表按它倒序
+  createdAt DateTime @default(now())
+
+  // 什么时候被哪个订单核销的；没用就是 NULL / NULL
+  usedAt  DateTime?
+  orderId String?   @unique
+  order   Order?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([userId, usedAt]) // 「我的券」三个 tab：按用户筛、按用没用过筛
+  @@index([userId, couponId]) // 领券时数「这个人已经领了几张」
+  @@map("user_coupons")
+}
+
+// ---------------------------------------------------------------------------
+// 退款申请
+//
+// 【为什么退款要单独一张表，而不是在 Order 上加几个字段】
+// 一次退款有它自己的一串属性：谁申请的、为什么、管理员怎么批的、批了多少钱。
+// 全塞进 Order 的话，订单表会变成「订单 + 售后工单」两张表缝在一起的东西，
+// 而且被拒绝之后要重新申请时，上一次的理由和批注该往哪放？没地方放。
+// 拆出来之后，一次申请 = 一行，「被拒 → 再申请」天然就是多行历史。
+//
+// 【为什么 orderId 不加 @unique】
+// 加了就变成「一单只能申请一次退款」。但拒绝之后用户要能再申请
+// （需求里明确要求），所以历史必须允许多行。防重复申请不靠数据库约束，
+// 靠订单状态：申请时是条件更新 `UPDATE orders SET status='REFUNDING'
+// WHERE status IN ('PAID','SHIPPED','COMPLETED')`，只有把订单推进
+// REFUNDING 成功的那一次，才会插入这张表的行 —— 并发的第二次 updateMany
+// 影响行数为 0，直接拒绝。
+//
+// 【为什么退款金额也要存一份快照】
+// 申请时先快照一次（页面上要显示「预计退款 ¥799」），批准时再用
+// 订单当前实际的实付金额重新确认一遍。存快照不是为了「批准时用它」，
+// 而是为了留痕：客服复盘时能看出「用户申请时看到的是多少」。
+//
+// 【previousStatus 是干什么的】
+// 退款是从 PAID / SHIPPED / COMPLETED 三个状态进来的，被拒绝之后
+// 要回到**原来那个**状态（退回 PAID 的人还能发货，退回 COMPLETED 的人
+// 已经收过货了）。不记下来的话，拒绝时只能靠猜。
+// ---------------------------------------------------------------------------
+model RefundRequest {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // "SIZE" | "QUALITY" | "REGRET" | "OTHER" —— SQLite 无 enum，靠 TS 层约束
+  reason      String
+  description String? // 买家补充说明，选填
+
+  // "PENDING" | "APPROVED" | "REJECTED" | "REFUNDED"
+  //
+  // 【为什么 APPROVED 和 REFUNDED 要分开】
+  // 练手阶段的「批准」就是一步到位（钱立刻退）。分开是为了以后接真实
+  // 支付网关时不用改数据：那时候批准只是提交退款请求，要等网关回调
+  // 才变成 REFUNDED。现在没有中间态，所以两位一体 —— 批准事务里
+  // 直接把 status 写成 REFUNDED，APPROVED 保留但暂时不会被写入。
+  status String @default("PENDING")
+
+  // 单位：分。见上方注释 —— 这是「实付」的金额，不是原价
+  refundAmount Int
+
+  // 管理员拒绝时必填的理由；批准时可填可不填
+  adminNote String?
+
+  // 提交申请时订单是什么状态，拒绝时用来回滚
+  previousStatus String
+
+  createdAt   DateTime  @default(now())
+  processedAt DateTime? // 批准/拒绝的时间
+
+  // 后台「待处理 / 已处理」两个 tab：按 status 筛、按提交时间倒序
+  @@index([status, createdAt])
+  // 订单详情页要查「这一单的退款历史」
+  @@index([orderId, createdAt])
+  @@index([userId])
+  @@map("refund_requests")
+}

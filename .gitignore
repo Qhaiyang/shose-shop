@@ -32,6 +32,27 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# 但模板文件要提交，否则别人 clone 下来不知道要配哪些变量
+!.env.example
+
+# 【没有「忽略数据库文件」这一条了】
+# 这里原本有 *.db / *.db-wal / *.db-shm 四条，对应 SQLite 时代的
+# dev.db / test.db / e2e.db。换到 PostgreSQL 之后数据库不再是一个文件，
+# 而是本机的服务进程，没有任何东西需要在仓库里忽略。
+# 留着那几行只会让人以为「这个项目还在用 SQLite 文件库」
+
+# 本地临时文件（一次性验证脚本、Chrome 调试 profile 之类）
+/tmp
+
+# Playwright 的产物：失败截图/视频、trace、HTML 报告。
+# 都是每次跑完生成的，不该进仓库
+/test-results
+/playwright-report
+/blob-report
+/playwright/.cache
+
+# E2E 用的独立构建目录（见 next.config.ts 的 distDir）
+/.next-e2e
 
 # vercel
 .vercel
@@ -39,3 +60,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/src/generated/prisma
+
+# AI ����Ŀ¼�����ύ��
+.agents/
+.claude/
+.windsurf/
+skills-lock.json
