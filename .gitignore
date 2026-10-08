@@ -63,7 +63,7 @@ next-env.d.ts
 
 /src/generated/prisma
 
-# AI ¹¤¾ßÄ¿Â¼£¨²»Ìá½»£©
+# AI å·¥å…·ç›®å½•ï¼ˆä¸æäº¤ï¼‰
 .agents/
 .claude/
 .windsurf/
