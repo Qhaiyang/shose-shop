@@ -214,13 +214,32 @@ async function countClaimsByCoupon(userId: string): Promise<Map<string, number>>
  * 领取一张券。
  *
  * 【为什么要用原生 SQL 而不是 prisma.userCoupon.create()】
- * 「每人限领 N 张」必须在**一条语句里**判断并插入，否则并发的两次点击会像这样：
+ * 「每人限领 N 张」的判断和插入必须是**一步**，否则并发的两次点击会像这样：
  *   A: 数一下 → 0 张（没超限）
  *   B: 数一下 → 0 张（也没超限）
  *   A: 插入
  *   B: 插入            ← 结果领了 2 张，而限领是 1
- * 这是典型的「先查后写」竞态。写成 INSERT ... SELECT ... WHERE 之后，
- * 「数」和「插」是同一个语句，中间没有缝。
+ * 这是典型的「先查后写」竞态。
+ *
+ * 【但「写成一条 INSERT ... SELECT」并不足以解决它 —— 这里踩过坑】
+ * 曾经的写法是：
+ *     INSERT INTO "user_coupons" ... SELECT ...
+ *     WHERE (SELECT COUNT(*) FROM "user_coupons" WHERE ...) < 限领数
+ * 当时的理由是「数」和「插」在同一个语句里，中间没有缝。**这个理由是错的。**
+ *
+ * PostgreSQL 默认隔离级别是 READ COMMITTED，而它的语义是：**每条语句开始
+ * 执行时取一次自己的快照**。两个并发的 INSERT ... SELECT 各算各的 COUNT ——
+ * 都从自己的快照里读到 0，都判定没超限，都插入。这里的 COUNT 只是一次普通
+ * 的读，**不持有任何锁**，所以两条语句谁也不用等谁，这个缝一直都在。
+ *
+ * 【对照：为什么 UPDATE ... WHERE 就没有这个问题】
+ *     UPDATE "coupons" SET "usedCount" = "usedCount" + 1 WHERE "usedCount" < 100
+ * 这条是安全的：UPDATE 锁住目标行之后，会拿**最新提交的版本重算一遍 WHERE**
+ * （PostgreSQL 里叫 EvalPlanQual），算不过就不改。所以「同一个语句」不等于
+ * 「同一份快照」—— UPDATE 会重算，INSERT ... SELECT 不会。本文件别处的券
+ * 核销、以及 orders.ts 的扣库存，能直接靠条件更新保证并发安全就是因为这个。
+ *
+ * 【所以串行化得另外给】见下面 pg_advisory_xact_lock 那一段。
  *
  * 【为什么 id 和 createdAt 要自己传】
  * $executeRaw 是绕过 Prisma 的原生 SQL —— @default(cuid()) 和
@@ -251,20 +270,41 @@ export async function claimCoupon(
   if (row.usedCount >= row.totalLimit) return { ok: false, error: "这张券已被抢完" }
 
   const id = crypto.randomUUID()
-  // 【列名为什么都带双引号 —— PostgreSQL 迁移时踩出来的】
-  // PostgreSQL 会把不加引号的标识符一律折叠成小写，而建表时列名是
-  // 带引号的 "userId" / "couponId" / "createdAt"（大小写敏感）。
-  // 裸写会直接报「字段 "userid" 不存在」（SQLSTATE 42703）——
-  // SQLite 不区分大小写，所以这份 SQL 从 SQLite 搬过来时看着完全正常。
-  // 表名 user_coupons 本身是小写，加引号只是为了保持一致的写法。
-  const affected = await prisma.$executeRaw`
-    INSERT INTO "user_coupons" ("id", "userId", "couponId", "createdAt")
-    SELECT ${id}, ${userId}, ${couponId}, ${now.toISOString()}
-    WHERE (
-      SELECT COUNT(*) FROM "user_coupons"
-      WHERE "userId" = ${userId} AND "couponId" = ${couponId}
-    ) < ${row.perUserLimit}
-  `
+
+  const affected = await prisma.$transaction(async (tx) => {
+    // 1. 先取锁，再数、再插。顺序不能反 —— 反了等于没锁。
+    //
+    //    锁的粒度**正好就是业务约束的粒度**：同一个人领同一张券串行，
+    //    不同的人领同一张券、同一个人领不同的券，互不阻塞。
+    //
+    //    必须在事务里取：`_xact_` 后缀的锁只在事务内有意义，事务一结束
+    //    （提交或抛错回滚都一样）自动释放，不需要手动 unlock，异常路径
+    //    也不会漏掉一把锁。在事务外调它等于没加锁。
+    //
+    //    【已知的缺陷：hashtext 会碰撞】
+    //    两个不同的 (userId, couponId) 有可能算出同一对整数，于是两个
+    //    本来互不相干的领券操作被串行化。这是**性能损失，不是正确性问题**
+    //    （顶多多等一会儿，不会多领）。练手项目接受这个代价。
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${userId}), hashtext(${couponId}))`
+
+    // 2. 拿到锁之后执行原来的「数 + 插」。此刻同一个 (userId, couponId)
+    //    上不可能再有另一个请求夹在这两步中间
+    //
+    // 【列名为什么都带双引号 —— PostgreSQL 迁移时踩出来的】
+    // PostgreSQL 会把不加引号的标识符一律折叠成小写，而建表时列名是
+    // 带引号的 "userId" / "couponId" / "createdAt"（大小写敏感）。
+    // 裸写会直接报「字段 "userid" 不存在」（SQLSTATE 42703）——
+    // SQLite 不区分大小写，所以这份 SQL 从 SQLite 搬过来时看着完全正常。
+    // 表名 user_coupons 本身是小写，加引号只是为了保持一致的写法。
+    return tx.$executeRaw`
+      INSERT INTO "user_coupons" ("id", "userId", "couponId", "createdAt")
+      SELECT ${id}, ${userId}, ${couponId}, ${now.toISOString()}
+      WHERE (
+        SELECT COUNT(*) FROM "user_coupons"
+        WHERE "userId" = ${userId} AND "couponId" = ${couponId}
+      ) < ${row.perUserLimit}
+    `
+  })
 
   if (affected === 0) {
     return { ok: false, error: `每人限领 ${row.perUserLimit} 张，你已经领过了` }

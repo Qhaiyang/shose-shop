@@ -85,9 +85,16 @@ describe("领券", () => {
   })
 
   it("并发领券不会突破「每人限领」", async () => {
-    // 【这是 atomic INSERT ... SELECT 的证明】
-    // 朴素写法（先 count 再 insert）在这个测试下必然失败：
-    // 10 个并发请求都读到「已领 0 张」，于是都插入，最后领到 10 张。
+    // 【这条测试证明的是：光靠 INSERT ... SELECT 不够】
+    // 曾经以为把「数」和「插」写进一个语句就原子了。不是 ——
+    // PostgreSQL 默认的 READ COMMITTED 下每条语句取自己的快照，并发时
+    // 各自的 COUNT(*) 都读到 0，都插入，最后领到 10 张。
+    //
+    // 所以 claimCoupon 里另加了一把 pg_advisory_xact_lock 做串行化
+    // （见 src/lib/coupons-db.ts）。这条用例就是那把锁的证据：
+    // 修复前实测 15 次跑红 8 次，修复后 15 次全绿。
+    //
+    // 留在这里别删 —— 哪天有人觉得那把锁多余、顺手去掉，这条会立刻红。
     const user = await makeUser()
     const coupon = await makeCoupon({ perUserLimit: 2 })
 
