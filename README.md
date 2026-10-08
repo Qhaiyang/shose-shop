@@ -729,7 +729,7 @@ npm run db:reset -- --db=shoptest # 换成操作指定的库
 |---|---|
 | 代码仓库 | <https://github.com/Qhaiyang/shose-shop> |
 | 生产数据库 | Neon 托管 PostgreSQL，**Singapore**（`ap-southeast-1`） |
-| 线上地址 | <https://shose-shop-lxbt5bmd-qhaiyang.vercel.app> |
+| 线上地址 | <https://shose-shop-beta.vercel.app> |
 | Build Command | `prisma migrate deploy && next build` |
 
 > ⚠️ **打不开线上地址是正常的** —— Vercel 默认域名 `*.vercel.app` 在国内直连不稳定，
