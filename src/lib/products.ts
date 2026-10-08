@@ -562,13 +562,37 @@ export async function createSku(
     // 这里有两个唯一约束可能被触发，要分开给提示：
     //   @@unique([productId, size, color]) → 这个尺码+颜色已经存在了
     //   skuCode @unique                    → 货号撞了（极小概率）
+    //
+    // 【怎么区分撞的是哪一条 —— 不要去看错误里的约束名】
+    // 这里原本写的是 `String(error.meta?.target ?? "").includes("skuCode")`。
+    // 那在 Prisma 7 上**永远为 false** —— P2002 的 meta 里只有
+    // { driverAdapterError, table }，根本没有 target（约束名埋在驱动错误的
+    // 深层结构里）。后果是「货号重复了」那条分支成了死代码：真撞上货号时，
+    // 管理员会收到「这个规格已经存在了」—— 一句把他引向错误方向的话，
+    // 他会去找一个根本不存在的重复规格。
+    //
+    // 【现在改用一次查询当判据】
+    // 按 (productId, size, color) 查一次：查得到，说明是这个组合重复；
+    // 查不到，就只可能是货号撞了。查询结果自己就是判据，
+    // 不依赖任何 Prisma 的内部结构，换版本也不会碎
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === "P2002"
     ) {
-      const target = String(error.meta?.target ?? "")
+      const sameSpec = await prisma.sku.findUnique({
+        // productId_size_color 是 schema 里 @@unique([productId, size, color])
+        // 自动生成的复合键名
+        where: {
+          productId_size_color: {
+            productId,
+            size: input.size,
+            color: input.color,
+          },
+        },
+        select: { id: true },
+      })
 
-      if (target.includes("skuCode")) {
+      if (!sameSpec) {
         return { ok: false, error: "货号重复了，请再试一次" }
       }
 
