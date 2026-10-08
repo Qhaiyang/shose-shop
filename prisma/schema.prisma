@@ -146,6 +146,21 @@ model Order {
   userId  String
   user    User   @relation(fields: [userId], references: [id])
 
+  // 客户端生成的一次性幂等键，把「同一次结算的重复提交」收敛成同一单。
+  //
+  // 【为什么需要它】用户双击提交、网络超时重试、或者两个请求同时在途时，
+  // 服务端会各读到一份还没被清空的购物车，于是扣两次库存、建两笔订单。
+  // 下单事务最后那步 cartItem.deleteMany 只能挡住「先后到达」的第二次，
+  // 挡不住「同时到达」的两个请求 —— 这里是并发那道闸。
+  //
+  // 【为什么可空】老订单和测试造的数据没有键，它们不该被约束打扰。
+  // PostgreSQL 的唯一索引把多个 NULL 视为互不相等，所以一堆 NULL 各行其是。
+  //
+  // 【为什么是 (userId, idempotencyKey) 复合而不是全局唯一】幂等的作用域
+  // 就是「一个人一次结算」。做成全局唯一的话，别人随手猜到/复用同一个键
+  // 就会撞到我的订单上，等于给了一条跨用户探测订单的口子
+  idempotencyKey String?
+
   // "PENDING_PAYMENT" | "PAID" | "SHIPPED" | "COMPLETED" | "CANCELLED"
   // "REFUNDING" | "REFUNDED"
   status String @default("PENDING_PAYMENT")
@@ -210,6 +225,7 @@ model Order {
   // 这张订单的退款申请历史（可能有多条：被拒之后还能再申请）
   refunds RefundRequest[]
 
+  @@unique([userId, idempotencyKey]) // 同一个人的同一个幂等键只允许落一行
   @@index([userId])
   @@index([status, expiresAt]) // 超时扫描专用索引
   @@map("orders")

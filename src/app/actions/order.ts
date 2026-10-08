@@ -76,9 +76,21 @@ export async function createOrderAction(
       ? rawUserCouponId
       : null
 
+  // 【幂等键为什么也不过 zod，和券同一个道理】
+  // 它没有任何「格式合法与否」可言 —— 客户端给的任意字符串都能用，
+  // 服务端拿它去数据库里比一下就知道重没重复。真正需要校验的
+  // 是它**属于谁**，而那件事是靠 where 里的 userId 保证的，
+  // 不是靠格式检查。空串（隐藏字段没渲染出来）归成 null = 不做幂等
+  const rawIdempotencyKey = formData.get("idempotencyKey")
+  const idempotencyKey =
+    typeof rawIdempotencyKey === "string" && rawIdempotencyKey !== ""
+      ? rawIdempotencyKey
+      : null
+
   const result = await createOrderFromCart(user.id, {
     ...parsed.data,
     userCouponId,
+    idempotencyKey,
   })
 
   if (!result.ok) {

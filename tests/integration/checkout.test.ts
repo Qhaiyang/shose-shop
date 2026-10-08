@@ -330,3 +330,154 @@ describe("订单快照：下单之后改商品，历史订单不受影响", () =
     expect(order.items[0].skuCode).toBeTruthy()
   })
 })
+
+// ============================================================================
+// 幂等键：同一个下单请求重复到达，只能落成一笔订单
+//
+// 【要挡的三种「重复到达」】
+//   1. 用户双击提交按钮
+//   2. 请求超时被网络层重试
+//   3. 两个请求同时在途 —— 这一种最危险
+//
+// 前两种其实已经被「下单后清空购物车」挡住了（第二次会撞「购物车是空的」），
+// 但第 3 种挡不住：两个请求都读到了还没被清空的购物车。
+// 幂等键补的就是这个洞，靠的是 Order 上 (userId, idempotencyKey) 的唯一约束。
+//
+// 【为什么不用「先查后写」单独实现】
+// 先查后写在并发下必然漏 —— 两个请求都查不到、都往下走。
+// 唯一约束是数据库给的原子性保证，这才是说了算的那一道。
+// ============================================================================
+
+describe("幂等键：重复提交只落一笔订单", () => {
+  it("同一个键顺序提交两次 → 只有一单，第二次把第一单原样还回来", async () => {
+    const { userId, sku } = await makeShop({ price: 89900, stock: 10 })
+    await addToCart(userId, sku.id, 3)
+
+    const input = {
+      address: ADDRESS,
+      phone: PHONE,
+      idempotencyKey: "idem-sequential",
+    }
+
+    const first = await createOrderFromCart(userId, input)
+    // 第二次到达时购物车已经被第一单清空了。如果幂等早查排在了
+    // 「读购物车」后面，这里会返回「购物车是空的」—— 一句正在误导用户的
+    // 错误提示（他其实早就下单成功了）。所以早查必须在读购物车之前
+    const second = await createOrderFromCart(userId, input)
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    expect(second.ok && second.orderId).toBe(first.ok && first.orderId)
+    expect(second.ok && second.orderNo).toBe(first.ok && first.orderNo)
+
+    // 库存只扣了一次（10 - 3），订单只有一笔
+    expect(await stockOf(sku.id)).toBe(7)
+    expect(await prisma.order.count()).toBe(1)
+  })
+
+  it("同一个键并发提交两次 → 唯一约束兜底，只有一单、库存只扣一次", async () => {
+    // 【这是幂等键存在的真正理由】
+    // 两个请求同时在途，都读到还没被清空的购物车，都扣库存、都建单。
+    // 唯一约束只放行一个，输的那个事务整体回滚 ——
+    // 它已经扣掉的库存必须跟着还回来，否则就成了「订单只有一笔、库存扣了两次」
+    const { userId, sku } = await makeShop({ price: 89900, stock: 10 })
+    await addToCart(userId, sku.id, 2)
+
+    const input = {
+      address: ADDRESS,
+      phone: PHONE,
+      idempotencyKey: "idem-concurrent",
+    }
+    const [a, b] = await Promise.all([
+      createOrderFromCart(userId, input),
+      createOrderFromCart(userId, input),
+    ])
+
+    expect(a.ok).toBe(true)
+    expect(b.ok).toBe(true)
+    // 两次拿到的必须是同一笔订单 —— 对用户来说「点了几次，看到的是同一单」
+    expect(a.ok && a.orderId).toBe(b.ok && b.orderId)
+
+    expect(await prisma.order.count()).toBe(1)
+    // 关键断言：应该是 10 - 2 = 8，而不是 6。
+    // 6 就说明输的那个请求扣的库存没被回滚
+    expect(await stockOf(sku.id)).toBe(8)
+  })
+
+  it("不同的键 → 各成一单（键没有被错误复用）", async () => {
+    const { userId, sku } = await makeShop({ price: 89900, stock: 10 })
+
+    await addToCart(userId, sku.id, 1)
+    const first = await createOrderFromCart(userId, {
+      address: ADDRESS,
+      phone: PHONE,
+      idempotencyKey: "idem-a",
+    })
+
+    // 换一个键 = 「又买了一次」，必须真的成单。
+    // 如果实现里把键当成了「这个用户下过单就不再下」，这条会挂
+    await addToCart(userId, sku.id, 1)
+    const second = await createOrderFromCart(userId, {
+      address: ADDRESS,
+      phone: PHONE,
+      idempotencyKey: "idem-b",
+    })
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    expect(second.ok && second.orderId).not.toBe(first.ok && first.orderId)
+    expect(await prisma.order.count()).toBe(2)
+    expect(await stockOf(sku.id)).toBe(8)
+  })
+
+  it("作用域是单个人：两个人用同一个键互不干扰", async () => {
+    // 唯一约束是 (userId, idempotencyKey) 复合的，不是 idempotencyKey 全局唯一。
+    // 全局唯一的话，别人猜到/复用一个键就能顶掉我的订单，等于开了一条
+    // 跨用户探测订单的口子。这条测试守住的就是那个 userId 前缀
+    const product = await makeProduct()
+    const sku = await makeSku(product.id, { stock: 10 })
+
+    const alice = await makeUser()
+    const bob = await makeUser()
+    await addToCart(alice.id, sku.id, 1)
+    await addToCart(bob.id, sku.id, 1)
+
+    const input = { address: ADDRESS, phone: PHONE, idempotencyKey: "same-key" }
+    const [ra, rb] = await Promise.all([
+      createOrderFromCart(alice.id, input),
+      createOrderFromCart(bob.id, input),
+    ])
+
+    expect(ra.ok).toBe(true)
+    expect(rb.ok).toBe(true)
+    expect(ra.ok && ra.orderId).not.toBe(rb.ok && rb.orderId)
+    expect(await prisma.order.count()).toBe(2)
+    // 两单各扣一件，谁也没被别人的键吃掉
+    expect(await stockOf(sku.id)).toBe(8)
+  })
+
+  it("不带幂等键 → 行为和加这个字段之前完全一样", async () => {
+    // 兼容性守卫：字段是可选的，内部调用（脚本、测试造数）都不传，
+    // 它们的行为不能因为这次改动发生任何变化
+    const { userId, sku } = await makeShop({ price: 89900, stock: 10 })
+    await addToCart(userId, sku.id, 1)
+
+    const first = await createOrderFromCart(userId, {
+      address: ADDRESS,
+      phone: PHONE,
+    })
+    expect(first.ok).toBe(true)
+
+    const order = await prisma.order.findUniqueOrThrow({
+      where: { id: first.ok ? first.orderId : "" },
+    })
+    // 没带键就存 NULL，而不是空串 —— 空串会变成一个「人人都一样」的键，
+    // 那样第二个不带键的订单反而会撞上第一个
+    expect(order.idempotencyKey).toBeNull()
+
+    // 老的防重复行为原样保留：第二次提交撞「购物车是空的」
+    await expect(
+      createOrderFromCart(userId, { address: ADDRESS, phone: PHONE }),
+    ).resolves.toEqual({ ok: false, error: "购物车是空的" })
+  })
+})

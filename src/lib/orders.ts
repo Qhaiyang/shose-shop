@@ -1,4 +1,7 @@
-import type { Prisma } from "@/generated/prisma/client"
+// 这里要的是**值**导入而不是 `import type`：下面判断唯一约束冲突时
+// 要用 `error instanceof Prisma.PrismaClientKnownRequestError`，
+// 而 instanceof 的右边必须是一个运行时的类。类型用法（Prisma.xxx）不受影响
+import { Prisma } from "@/generated/prisma/client"
 import {
   canTransition,
   isNoteEditable,
@@ -135,6 +138,39 @@ export type CreateOrderInput = {
    * 浏览器里的金额永远是预览，不是依据
    */
   userCouponId?: string | null
+  /**
+   * 选填：本次结算的幂等键，由客户端在**进入结算页时**生成一次并保持不变。
+   *
+   * 【它是干什么的】用户双击提交、网络超时后重试、两个请求同时在途 ——
+   * 这些都会让同一个「结算意图」到达服务端两次。带上同一个键，
+   * 第二次到达时就只是把第一次那一单还回去，不会再扣一次库存、建第二笔订单。
+   *
+   * 【为什么可选】不传就是「不做幂等」，行为和加这个字段之前完全一样。
+   * 内部调用（脚本、测试造数）不需要它。
+   */
+  idempotencyKey?: string | null
+}
+
+/**
+ * 判断错误是不是「唯一约束冲突」（P2002）。
+ *
+ * 和 favorites-db.ts、coupons-db.ts 里是同一个写法：先 instanceof
+ * 再比 code。用 instanceof 而不是只看 `error.code === "P2002"`，
+ * 是为了不把「别的库里恰好也有个 code 字段」当成数据库错误。
+ *
+ * 【注意它只说「有唯一约束被撞了」，没说撞的是哪一个】
+ * orders 表上 orderNo 和 (userId, idempotencyKey) 各有一条唯一约束，
+ * 撞了都长这样。要区分得看约束名，而 Prisma 7 的 P2002 的 meta 里
+ * 只有 { driverAdapterError, table } —— 约束名埋在驱动错误的深层结构
+ * 里，去挖它等于把 Prisma 的内部实现焊进业务代码，换个版本就碎。
+ * 所以这个函数只负责「是不是唯一冲突」，具体是哪一个由调用方
+ * 查一次库来判断（见下面的 catch）。查询本身就是判据
+ */
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  )
 }
 
 export type CreateOrderResult =
@@ -173,6 +209,29 @@ export async function createOrderFromCart(
   userId: string,
   input: CreateOrderInput,
 ): Promise<CreateOrderResult> {
+  // ---- 0. 幂等早查：这个键已经下过单，就把那一单原样还回去 ----
+  //
+  // 【为什么这一步必须排在「读购物车」前面】
+  // 重复提交时购物车很可能已经被第一次提交清空了。先读购物车的话，
+  // 第二次请求会撞上下面的「购物车是空的」，用户看到一句误导的话 ——
+  // 而他其实早就下单成功了。顺序在这里是有意义的，不是随手放的。
+  //
+  // 空字符串/纯空白一律归成 null：HTML 表单里的隐藏字段没渲染出来时
+  // 就是空串，那等于「没带键」，不能被当成一个有效的幂等键
+  const idempotencyKey = input.idempotencyKey?.trim() || null
+  if (idempotencyKey) {
+    const existing = await prisma.order.findUnique({
+      // userId_idempotencyKey 是 schema 里 @@unique([userId, idempotencyKey])
+      // 自动生成的复合键名。带上 userId 一起查，键的作用域就锁死在本人
+      where: { userId_idempotencyKey: { userId, idempotencyKey } },
+      select: { id: true, orderNo: true },
+    })
+
+    if (existing) {
+      return { ok: true, orderId: existing.id, orderNo: existing.orderNo }
+    }
+  }
+
   // ---- 1. 读购物车（放在事务外面）----
   // 为了写注释清楚，这一步先读出来。真正需要原子性的只有下面的扣减，
   // 而且购物车内容读完之后就算被并发改动了，也不会影响扣减的正确性 ——
@@ -306,6 +365,10 @@ export async function createOrderFromCart(
         data: {
           orderNo,
           userId,
+          // 幂等键落到订单上，成为「这次结算已经发生过」的唯一凭证。
+          // 没带键就是 NULL —— PostgreSQL 的唯一索引把多个 NULL 视为
+          // 互不相等，所以不带键的订单彼此不冲突
+          idempotencyKey,
           // 新订单一律是「待支付」。状态机见 src/lib/constants.ts
           status: ORDER_STATUS.PENDING_PAYMENT,
           totalAmount,
@@ -384,6 +447,38 @@ export async function createOrderFromCart(
     // 不是系统故障。事务已经回滚干净 —— 库存扣了又还、券的名额占了又退
     if (error instanceof CouponUnavailableError) {
       return { ok: false, error: error.message }
+    }
+
+    // ---- 幂等键撞了唯一约束：并发下的兜底 ----
+    //
+    // 走到这里说明上面那次早查没查到 —— 另一个请求几乎同时在途，
+    // 两边都以为自己是第一次。数据库的唯一索引只放行了一个，
+    // 输的那个在建单那一步被拒（P2002），整个事务已经回滚干净：
+    // 扣掉的库存退回去了、占掉的券名额也退回去了。
+    //
+    // 所以这里只要把赢家那一单查出来还回去就行。对用户来说，
+    // 「点了几次，看到的永远是同一笔订单」——这正是幂等要的结果。
+    //
+    // 【为什么能查到】唯一索引拒绝了这次插入，说明冲突的那一行已经
+    // 提交成功（还没提交的话这次插入会先被阻塞，而不是直接报错）。
+    //
+    // 【这一步查库同时兼任「区分撞的是哪条约束」】
+    // orderNo 撞了也是 P2002，但那是真失败，不该去捞别人的订单。
+    // 判断办法不是去看错误里的约束名，而是直接按 (userId, idempotencyKey)
+    // 查一次：查得到 = 刚才是它挡的，把这一单还回去；查不到 = 撞的是
+    // 订单号，落到函数末尾原样抛出去。查询结果自己就是判据，
+    // 不依赖任何 Prisma 的内部结构
+    if (idempotencyKey && isUniqueConstraintError(error)) {
+      const winner = await prisma.order.findUnique({
+        where: { userId_idempotencyKey: { userId, idempotencyKey } },
+        select: { id: true, orderNo: true },
+      })
+
+      // 查不到只会出现在「赢家又被删了」这种极端情况，
+      // 那就当作普通失败抛出去，不要硬编一个订单号
+      if (winner) {
+        return { ok: true, orderId: winner.id, orderNo: winner.orderNo }
+      }
     }
 
     // 其他错误（数据库连不上、订单号撞了……）是我们没预料到的，
