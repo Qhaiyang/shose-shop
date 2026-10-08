@@ -90,6 +90,11 @@ export async function resetDb(): Promise<void> {
   await prisma.product.deleteMany()
   await prisma.user.deleteMany()
   await prisma.sizeGuide.deleteMany()
+  // 支付网关的事件日志。它不引用任何表（orderId 是普通字符串、没有外键，
+  // 理由见 schema 里 WebhookEvent 的注释），所以放哪都行 ——
+  // 放最后是为了让它和上面那串「按依赖顺序排列」的删除分开，
+  // 免得后来的人以为它也必须排在某个位置
+  await prisma.webhookEvent.deleteMany()
 }
 
 // ---------------------------------------------------------------------------

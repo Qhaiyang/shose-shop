@@ -511,6 +511,67 @@ export async function createOrderFromCart(
 // 并发时只有第一个能匹配上（count=1），其余的 count=0 直接被拒。
 // ============================================================================
 
+/**
+ * 「把订单推成已支付」那条 UPDATE 的**唯一出处**。
+ *
+ * 【为什么必须抽出来，而不是两个入口各写一遍】
+ * 有两个入口会把订单推成已支付：
+ *   - payOrder               用户点「去支付」
+ *   - markOrderPaidFromStripe 支付网关的 webhook
+ * 它们的 WHERE 只差一处（要不要卡支付时限），但「把判断塞进 WHERE、
+ * 靠影响行数反推成败」这条核心逻辑必须**一模一样**。
+ * 抄两遍的话，哪天有人给其中一处补了个条件、忘了另一处，两边的并发语义
+ * 就分叉了 —— 而且分叉得毫无提示，只有在并发压测里才看得出来。
+ *
+ * 【为什么用两个显式布尔开关，而不是把 userId / expiresAt 做成可选参数】
+ * 照的是下面 makeTransition 的写法（发货 / 确认收货那一段）。
+ * 「WHERE 里少写一个 userId，就能改别人的订单」这种事，靠**省略参数**
+ * 来表达太危险 —— 读代码的人看不出这里是有意省略还是漏了。
+ * 所以安全的写法必须被显式写出来，再配一条运行时断言兜底。
+ *
+ * @returns 抢占成功（真的把这一行从「待支付」改走了）返回 true
+ */
+async function claimOrderPaid(
+  client: TxClient,
+  options: {
+    orderId: string
+    /** 要写入的支付时间。抽成参数是为了让两个入口各自用「它那一瞬间」的时间 */
+    paidAt: Date
+    /** 是否把订单限定在某个用户名下。用户点的支付必须传 true */
+    scopeToUser: boolean
+    userId?: string
+    /**
+     * 要不要卡支付时限。
+     *   true  —— 用户点的支付：过了时限就不该再让他付
+     *            （expiresAt > now 进 WHERE）
+     *   false —— 支付网关的回调：**钱已经收了**，时限不再是拒绝的理由。
+     *            这时候唯一该看的条件是 status 还没被 cron 改走
+     */
+    requireNotExpired: boolean
+  },
+): Promise<boolean> {
+  if (options.scopeToUser && !options.userId) {
+    throw new Error("claimOrderPaid: scopeToUser 为真时必须给 userId")
+  }
+
+  const result = await client.order.updateMany({
+    where: {
+      id: options.orderId,
+      // userId 进 WHERE 而不是查出来再 if：越权在数据层就被挡死
+      ...(options.scopeToUser ? { userId: options.userId } : {}),
+      status: ORDER_STATUS.PENDING_PAYMENT,
+      // 和 paidAt 用同一个时刻：这条判断必须在「改的瞬间」成立
+      ...(options.requireNotExpired ? { expiresAt: { gt: options.paidAt } } : {}),
+    },
+    data: {
+      status: ORDER_STATUS.PAID,
+      paidAt: options.paidAt,
+    },
+  })
+
+  return result.count === 1
+}
+
 export type PayOrderResult = { ok: true } | { ok: false; error: string }
 
 /**
@@ -530,25 +591,22 @@ export async function payOrder(
 ): Promise<PayOrderResult> {
   const now = new Date()
 
-  // 一次条件更新搞定三件事：
-  //   1. 订单必须是这个人的          → userId
+  // 一次条件更新搞定三件事（条件本身写在 claimOrderPaid 里，两个入口共用）：
+  //   1. 订单必须是这个人的          → scopeToUser + userId
   //   2. 必须是待支付状态            → status（防止重复支付）
-  //   3. 必须还没过支付时限          → expiresAt（第 8 步的自动取消是兜底，
-  //      但用户不该在两个 cron 之间钻空子付一笔已经超时的订单）
-  const result = await prisma.order.updateMany({
-    where: {
-      id: orderId,
-      userId,
-      status: ORDER_STATUS.PENDING_PAYMENT,
-      expiresAt: { gt: now },
-    },
-    data: {
-      status: ORDER_STATUS.PAID,
-      paidAt: now,
-    },
+  //   3. 必须还没过支付时限          → requireNotExpired（第 8 步的自动取消
+  //      是兜底，但用户不该在两个 cron 之间钻空子付一笔已经超时的订单）
+  const claimed = await claimOrderPaid(prisma, {
+    orderId,
+    paidAt: now,
+    scopeToUser: true,
+    userId,
+    // 用户点的支付要卡时限。网关回调不卡 —— 那一边钱已经收了，
+    // 理由见 markOrderPaidFromStripe
+    requireNotExpired: true,
   })
 
-  if (result.count === 1) return { ok: true }
+  if (claimed) return { ok: true }
 
   // ---- 没改成，回去查清楚到底是哪一条不满足，给用户一个能看懂的提示 ----
   // 这一步只是「事后解释」，不承担并发安全 —— 安全已经由上面那条 SQL 保证了
@@ -578,6 +636,111 @@ export async function payOrder(
   }
 
   return { ok: false, error: "支付失败，请稍后重试" }
+}
+
+// ============================================================================
+// 支付网关回调：把订单推成已支付
+//
+// 【它和上面 payOrder 唯一的差别，就是「不卡支付时限」】
+//
+// payOrder 的 WHERE 里有 expiresAt > now，理由是「用户不该在两个 cron
+// 之间钻空子，付一笔已经超时的订单」—— 那时候拒绝是**安全**的，
+// 因为钱还没扣，用户看到一句「已超时，请重新下单」就走了。
+//
+// 回调这边的前提整个反了：**钱已经在 Stripe 那边收了**。
+// 此时「超过时限」不再是拒绝的理由 —— 拒收一笔已经到账的钱，
+// 换来的是「钱收了、订单却永远停在待支付」。
+//
+// 所以回调只认一个条件：status 还是不是 PENDING_PAYMENT。
+//   - 是   → 收下，推成已支付。哪怕此刻已经过了 expiresAt 也没关系，
+//            只要 cron 还没把这单扫走，库存就还锁着，收下不亏
+//   - 不是 → 说明 cron 先动手了（或者这单早就付过），交给调用方分辨
+//
+// 【为什么不让 payOrder 收一个 ignoreExpiry: boolean】
+// 见 claimOrderPaid 的注释：危险的能力不该藏在可选参数里。
+// 写成两个各自命名的函数，光看函数名就知道走的是哪条路。
+// ============================================================================
+
+/**
+ * 这次回调的结局。调用方（webhook handler）靠它决定 `appliedAt` 写不写。
+ */
+export type StripePaidOutcome =
+  /** 订单确实是「待支付」，这次被推成了「已支付」—— 正常路径 */
+  | "applied"
+  /**
+   * 订单已经在收款之后的状态了（已支付 / 已发货 / 已完成 / 退款中 / 已退款）。
+   *
+   * 这几个状态都意味着「这笔钱已经记过一次」，所以不需要做任何事，
+   * 也不需要人来处理 —— 它和 applied 一样是「自洽」的结局
+   */
+  | "already_paid"
+  /**
+   * 订单已经被超时取消，钱却收了。
+   *
+   * 【这是最需要人看到的一种结局】
+   * 库存已经被 cron 还回池子、可能已经被别人买走，券也退给用户了，
+   * 而钱在 Stripe 那边是真的扣了。这一轮的处理是「拒收 + 留痕」：
+   * 不改订单状态，由 webhook handler 记一行 appliedAt 为空的事件
+   * 等人处理（那个空值就是告警口径，见 prisma/schema.prisma 的
+   * WebhookEvent.appliedAt）。
+   *
+   * 【为什么不去恢复订单（CANCELLED → PAID）】
+   * 恢复要重新扣一次库存，而库存可能已经卖给下一个人了 —— 那就是超卖。
+   * 扣不到又只能退回「留痕等人处理」，等于多写一段永远走不通的代码。
+   * 加上 CANCELLED 本来就是状态机里的终态（见 constants.ts），
+   * 为一条罕见路径破掉它不划算
+   */
+  | "cancelled"
+  /** metadata 指的订单不存在。同样是「钱收了但没落到订单上」，同样要留痕 */
+  | "not_found"
+
+/**
+ * 支付网关确认收款后，把订单推成「已支付」。
+ *
+ * 【为什么必须由调用方传 tx，而不是自己开事务】
+ * 调用方要在这**同一笔事务**里再插一行 webhook_events（见
+ * src/lib/stripe-webhook.ts）。两件事必须一起提交或一起回滚：
+ * 如果只记了「事件已处理」却没改成订单，那这个事件以后重投时会被幂等
+ * 直接跳过，订单就永远停在待支付 —— 这是最坏的结局（静默丢单）。
+ * 所以事务边界归调用方，这个函数只负责其中一步。
+ *
+ * 【为什么不收 userId】
+ * 回调不是「某个用户在支付」，它没法也不该说明是谁付的。订单是靠
+ * metadata.orderId 定位的。这也是它不能复用 PayOrderResult 那套
+ * 「查一次、给用户选一句话」的原因 —— 这里根本没有用户可解释。
+ */
+export async function markOrderPaidFromStripe(
+  tx: TxClient,
+  orderId: string,
+  paidAt: Date = new Date(),
+): Promise<StripePaidOutcome> {
+  const claimed = await claimOrderPaid(tx, {
+    orderId,
+    paidAt,
+    // 回调不带用户：订单已经由 id 定位好了，
+    // 而「谁付的」这个问题在 webhook 里没有答案（也不需要有）
+    scopeToUser: false,
+    // 【和 payOrder 唯一的差别在这里】钱已经收了，时限不再是理由
+    requireNotExpired: false,
+  })
+
+  if (claimed) return "applied"
+
+  // 没抢到，回查一次把「为什么没抢到」翻译成一个明确的结局。
+  // 这一步不承担并发安全 —— 安全已经由上面那条 SQL 保证了
+  const order = await tx.order.findUnique({
+    where: { id: orderId },
+    select: { status: true },
+  })
+
+  // 订单不存在（metadata 指向了一个不存在的 id）
+  if (!order) return "not_found"
+
+  // 被 cron 取消了：钱收了、单没了，要留痕等人处理
+  if (order.status === ORDER_STATUS.CANCELLED) return "cancelled"
+
+  // 其余状态都在收款之后，说明这笔钱早就记过了
+  return "already_paid"
 }
 
 // ============================================================================

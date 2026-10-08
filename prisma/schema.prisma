@@ -161,6 +161,24 @@ model Order {
   // 就会撞到我的订单上，等于给了一条跨用户探测订单的口子
   idempotencyKey String?
 
+  // Stripe 的 PaymentIntent id（pi_xxx）。没走过 Stripe 支付的订单是 NULL。
+  //
+  // 【这一列是「订单 → PaymentIntent」的方向，webhook 用的是反方向】
+  // webhook 事件里带的是 pi_xxx，没有我们的 orderId。所以真正的定位
+  // 靠的是创建 PaymentIntent 时写进 metadata.orderId（见第二步）。
+  // 两样都要，缺一不可，但职责完全不同：
+  //   metadata.orderId    pi → 订单    （webhook 进来时用）
+  //   stripePaymentIntentId  订单 → pi （下面三件事用）
+  //
+  // 【订单 → pi 这个方向拿来干什么】
+  //   1. 复用它。用户点了两次「去支付」时，我们要 retrieve 出原来那个
+  //      PaymentIntent 继续用，而不是新建一个 —— 新建的话这一列会被覆盖，
+  //      而旧的那个 PI 可能还活着，它日后成功支付的 webhook 就找不到归属了
+  //   2. 从一张订单反查它的支付记录（对账、排查）
+  //   3. @unique 顺带保证「一个 PaymentIntent 只属于一张订单」，
+  //      万一哪天有人把同一个 pi 写到了两张订单上，数据库会当场拒绝
+  stripePaymentIntentId String? @unique
+
   // "PENDING_PAYMENT" | "PAID" | "SHIPPED" | "COMPLETED" | "CANCELLED"
   // "REFUNDING" | "REFUNDED"
   status String @default("PENDING_PAYMENT")
@@ -571,4 +589,84 @@ model RefundRequest {
   @@index([orderId, createdAt])
   @@index([userId])
   @@map("refund_requests")
+}
+
+// ---------------------------------------------------------------------------
+// 支付网关的 webhook 事件（目前只有 Stripe）
+//
+// 【这张表解决的是什么问题】
+// 支付网关的重投是**至少一次**（at-least-once），不是恰好一次。同一个事件
+// 可能投递两遍、三遍，而且它只认「2xx」这一个信号 —— 我们返回 500，它就
+// 会重试到成功为止，最长重试三天。所以「这个事件我处理过没有」必须有个
+// 地方记着，不能靠订单当前的状态去猜。
+//
+// 【为什么不能拿订单的 status 当幂等判据】
+// 那是把「事件级幂等」和「状态机」混成一个机制。status = PAID 只能说明
+// 「这单付过钱」，说不出「是哪一个事件让它付的钱」。重投到达时我们会看到
+// status 已经是 PAID，然后不知道该返回 200（别重试了）还是 500（重试吧）。
+// 更要命的是将来加 charge.refunded 这类**不改 status** 的事件时，
+// 根本没有状态位可抢。所以事件要自己记一份，见下面 eventId 的注释。
+//
+// 【这张表是「事件日志」，不是「订单的从属表」】
+// orderId 是可空的，而且**不设外键**：一个事件可能在订单还不存在时就到达
+// （metadata 缺失、或者订单被删了），那种行也必须留得下来 —— 那正是最需要
+// 被人看到的一类。设了外键就只能把它丢掉，等于把告警丢了。
+// ---------------------------------------------------------------------------
+model WebhookEvent {
+  id String @id @default(cuid())
+
+  // 支付渠道。目前只有 "stripe"，加这一列是为了将来接第二个渠道时
+  // 不必改唯一约束 —— 见下面 @@unique 的注释
+  provider String @default("stripe")
+
+  // 渠道方给的事件 id，如 Stripe 的 "evt_1A2B3C..."。
+  //
+  // 【为什么幂等的键在它身上，而不在我们的 orderId 上】
+  // 它是**外部系统生成的、全局唯一、且重投时不变**的标识 —— 这三条
+  // 正好是幂等键该有的性质。而 orderId 做不到：同一个订单会收到多个事件
+  // （支付成功、退款、争议……），拿它当键会把第二个事件误判成重投。
+  eventId String
+
+  // 事件类型，如 "payment_intent.succeeded"。排查时一眼能看出这行是什么事件
+  type String
+
+  // 这个事件关联到的订单（从 metadata.orderId 取）。
+  // 可空且不设外键，理由见模型上方注释
+  orderId String?
+
+  receivedAt DateTime @default(now())
+
+  // 【这一列是判决，不是中间态 —— 列名就是为此而改的】
+  // 它回答的是「这行记录让订单状态发生变化了吗」，不是「处理完了吗」。
+  //
+  // 写入这张表和更新订单是在**同一个事务**里（见 src/lib/stripe-webhook.ts），
+  // 所以：事务崩了 → 整行回滚，不会留下一行「半处理」的记录。反过来说，
+  // 库里凡是存在的行，都必然是我们**主动**提交的结论。于是这一列为空
+  // 只可能表达一件事：收到了，但没能落到订单上。比如
+  //   - 订单已经超时取消，钱却收了   ← 最需要人看到的一种
+  //   - metadata.orderId 指向一个不存在的订单
+  // 那两种都要有人去处理，所以它们必须能被查出来。
+  //
+  // 【如果当初叫 processedAt 会怎样】
+  // 那个名字暗示「先插行、后处理」的两阶段，读代码的人会去找「没处理完
+  // 的行怎么恢复」—— 而单事务设计里不存在这种行，那段恢复逻辑写了也是死代码。
+  // 名字改掉，这个歧义就没了。
+  //
+  // 有值 = 事件被消化掉了（订单状态推进了，或者确认无需改动）。
+  appliedAt DateTime?
+
+  // 【唯一约束为什么带上 provider】
+  // eventId 是渠道自己的命名空间，只在它内部唯一。将来接了第二个渠道，
+  // 两家的 id 迟早会撞（都是随机串）。带上 provider，就等于「每个渠道
+  // 各自一个命名空间」，加渠道时不用回来改约束
+  @@unique([provider, eventId])
+  // 按订单排查「这单收过哪些事件」
+  @@index([orderId])
+  // 【应用健康检查用的索引】
+  // /api/health 的 orphanedWebhooks 数的是「收到了钱但没落到订单上」的事件，
+  // 查询是 WHERE appliedAt IS NULL AND orderId IS NOT NULL ——
+  // 正好走这条索引。它是个告警口径：练手项目没有告警系统，
+  // 这个计数就是唯一的出口（见 src/app/api/health/route.ts）
+  @@index([appliedAt])
+  @@map("webhook_events")
 }
