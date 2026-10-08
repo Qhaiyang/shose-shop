@@ -338,7 +338,19 @@ export async function createOrderFromCart(
       //      WHERE id = ? AND usedCount < totalLimit
       //
       // 影响 0 行 = 没抢到名额（被别人抢完了，或这张券刚被删）。
-      // 并发下 SQLite 会把这两条语句串行执行，第 11 个请求必然扑空。
+      //
+      // 【并发下为什么这条安全 —— 别再用 SQLite 时代的理由】
+      // 这里原来写的是「并发下 SQLite 会把这两条语句串行执行」。那是 SQLite
+      // 的机制（全局写锁），换到 PostgreSQL 之后已经不成立了。
+      // PostgreSQL 保证它靠的是另一件事：UPDATE 拿到目标行的锁之后，会拿
+      // **最新提交的版本重算一遍 WHERE**（EvalPlanQual），算不过就不改。
+      // 所以并发的第 N 个请求即便在应用层读到的是旧值也没关系 —— 真正决定
+      // 成败的是重算那一刻的值，超了就是影响 0 行。
+      //
+      // 【这就是「条件更新」和「INSERT ... SELECT」的分界线】
+      // 条件更新会重算 WHERE，所以能替代应用层加锁；INSERT ... SELECT 不会，
+      // 所以它并不安全 —— 领券那处踩的就是这个坑，见 coupons-db.ts 里的
+      // pg_advisory_xact_lock。
       //
       // 【注意表名写的是 coupons 而不是 Coupon】
       // $executeRaw 绕过 Prisma 的模型层，直接面对物理表，
