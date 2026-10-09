@@ -55,7 +55,7 @@ export function ImageListEditor({
             >
               {/* 缩略图：让管理员确认路径真的指向一张图，而不是某个 404 */}
               <div className="size-14 shrink-0 overflow-hidden rounded-md border bg-muted">
-                {/* eslint-disable-next-line @next/next/no-img-element -- 本地 SVG */}
+                {/* eslint-disable-next-line @next/next/no-img-element -- 本地图片 */}
                 <img src={url} alt="" className="size-full object-cover" />
               </div>
 
@@ -112,7 +112,7 @@ export function ImageListEditor({
         <Input
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          placeholder="/shoes/prod_running-3.svg"
+          placeholder="/shoes/prod_running-3.webp"
           className="font-mono text-xs"
         />
         <Button

@@ -84,7 +84,7 @@ export default async function OrdersPage() {
                 <div className="flex items-center gap-4 p-4">
                   <div className="size-16 shrink-0 overflow-hidden rounded-lg border bg-muted">
                     {order.coverImage ? (
-                      // eslint-disable-next-line @next/next/no-img-element -- 本地 SVG，见 product-card.tsx 的说明
+                      // eslint-disable-next-line @next/next/no-img-element -- 本地图片，见 product-card.tsx 的说明
                       <img
                         src={order.coverImage}
                         alt=""

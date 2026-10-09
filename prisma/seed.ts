@@ -356,9 +356,9 @@ async function main() {
   // ---- 2. 商品 + SKU ----
   for (const p of PRODUCTS) {
     const images = JSON.stringify([
-      `/shoes/${p.id}-1.svg`,
-      `/shoes/${p.id}-2.svg`,
-      `/shoes/${p.id}-3.svg`,
+      `/shoes/${p.id}-1.webp`,
+      `/shoes/${p.id}-2.webp`,
+      `/shoes/${p.id}-3.webp`,
     ])
 
     const product = await prisma.product.upsert({

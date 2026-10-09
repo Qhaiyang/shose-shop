@@ -55,7 +55,7 @@ export function parseYuanToCents(input: unknown): number | null {
  * 把多行文本解析成图片路径数组。
  *
  * 表单里让用户一行贴一个路径，比做一套上传 / 拖拽界面简单得多，
- * 也不需要引入对象存储。前台的图就是 public/shoes/ 下的本地 SVG，
+ * 也不需要引入对象存储。前台的图就是 public/shoes/ 下的本地图片（WebP），
  * 所以不强制 http(s)，相对路径更好用。
  */
 export function parseImageLines(input: unknown): string[] {

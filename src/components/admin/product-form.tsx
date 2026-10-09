@@ -154,7 +154,7 @@ export function ProductForm({
       <Field
         label="商品图片"
         errors={state?.errors?.images}
-        hint="图片放在 public/shoes/ 下，例如 /shoes/prod_running-1.svg。点「添加」加一张，用 ↑↓ 调整顺序。"
+        hint="图片放在 public/shoes/ 下，例如 /shoes/prod_running-1.webp。点「添加」加一张，用 ↑↓ 调整顺序。"
       >
         <ImageListEditor
           images={values.images}

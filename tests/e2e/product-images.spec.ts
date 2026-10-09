@@ -38,9 +38,9 @@ test("后台重排图片顺序 → 前台轮播按新顺序展示并切换", asy
   })
   await expect(imageRows).toHaveCount(3)
 
-  // 第 3 张图（-3.svg）被上移一位 → 顺序变成 -1, -3, -2
+  // 第 3 张图（-3.webp）被上移一位 → 顺序变成 -1, -3, -2
   await imageRows
-    .filter({ hasText: "prod_running-3.svg" })
+    .filter({ hasText: "prod_running-3.webp" })
     .getByRole("button", { name: "上移" })
     .click()
 
@@ -64,16 +64,16 @@ test("后台重排图片顺序 → 前台轮播按新顺序展示并切换", asy
   // 初始停在第 1 张
   await expect(page.getByText("1 / 3", { exact: true })).toBeVisible()
 
-  // 顺序持久化了：第 2 张缩略图现在是被上移的那张 -3.svg
+  // 顺序持久化了：第 2 张缩略图现在是被上移的那张 -3.webp
   await expect(
     page.getByRole("button", { name: "查看第 2 张图" }).locator("img"),
-  ).toHaveAttribute("src", /prod_running-3\.svg/)
+  ).toHaveAttribute("src", /prod_running-3\.webp/)
 
-  // 点第 3 张缩略图 → 计数器变 3 / 3，主图换到 -2.svg
+  // 点第 3 张缩略图 → 计数器变 3 / 3，主图换到 -2.webp
   await page.getByRole("button", { name: "查看第 3 张图" }).click()
   await expect(page.getByText("3 / 3", { exact: true })).toBeVisible()
   await expect(page.locator('img[alt*="商品图 3"]')).toHaveAttribute(
     "src",
-    /prod_running-2\.svg/,
+    /prod_running-2\.webp/,
   )
 })

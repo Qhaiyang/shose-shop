@@ -16,13 +16,15 @@ import type { ProductListItem } from "@/lib/products"
 export function ProductCard({ product }: { product: ProductListItem }) {
   return (
     <Link href={`/products/${product.id}`} className="group block">
-      <Card className="gap-0 overflow-hidden p-0 transition-shadow hover:shadow-lg">
+      <Card className="gap-0 overflow-hidden p-0 transition-[box-shadow,border-color] hover:border-foreground/20 hover:shadow-lg">
         {/* 图片区 */}
         <div className="relative aspect-square overflow-hidden bg-muted">
           {product.image ? (
-            // 这里用原生 <img> 而不是 next/image：图片是本地 SVG，next/image
-            // 处理 SVG 需要额外开 dangerouslyAllowSVG，收益也不大（SVG 本身
-            // 已经是矢量的，没有「优化压缩」的空间）
+            // 这里用原生 <img> 而不是 next/image：图片是 public/shoes/ 下的
+            // 本地文件，原生标签不需要在 next.config.ts 配任何东西，也不会
+            // 在构建期给每张图生成多套尺寸产物。代价是没有自动的 srcset 和
+            // 懒加载 —— 卡片图本来就压到 100KB 以内，这个取舍划得来
+            // （哪天要换成 next/image，先看 next.config.ts 里有没有 images 配置）
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={product.image}
@@ -56,7 +58,7 @@ export function ProductCard({ product }: { product: ProductListItem }) {
           </h3>
 
           <div className="flex items-baseline justify-between pt-1">
-            <span className="text-lg font-semibold text-primary">
+            <span className="text-xl font-bold tabular-nums text-primary">
               {formatPriceRange(product.minPrice, product.maxPrice)}
             </span>
             <span className="text-xs text-muted-foreground">

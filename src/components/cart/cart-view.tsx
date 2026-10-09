@@ -190,7 +190,7 @@ export function CartView({ isLoggedIn, initialDbItems }: CartViewProps) {
                 className="shrink-0 overflow-hidden rounded-lg border bg-muted"
               >
                 {item.image ? (
-                  // eslint-disable-next-line @next/next/no-img-element -- 本地 SVG，见 product-card.tsx 的说明
+                  // eslint-disable-next-line @next/next/no-img-element -- 本地图片，见 product-card.tsx 的说明
                   <img
                     src={item.image}
                     alt={item.productName}

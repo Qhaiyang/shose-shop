@@ -50,7 +50,7 @@ export function ImageGallery({ images, productName }: ImageGalleryProps) {
     <div className="space-y-3">
       {/* ---------------- 主图 ---------------- */}
       <div className="relative overflow-hidden rounded-xl border bg-muted">
-        {/* eslint-disable-next-line @next/next/no-img-element -- 本地 SVG，见 product-card.tsx 的说明 */}
+        {/* eslint-disable-next-line @next/next/no-img-element -- 本地图片，见 product-card.tsx 的说明 */}
         <img
           src={images[current]}
           alt={`${productName} 商品图 ${current + 1}`}
@@ -101,7 +101,7 @@ export function ImageGallery({ images, productName }: ImageGalleryProps) {
                   : "border-transparent opacity-60 hover:opacity-100",
               )}
             >
-              {/* eslint-disable-next-line @next/next/no-img-element -- 本地 SVG */}
+              {/* eslint-disable-next-line @next/next/no-img-element -- 本地图片 */}
               <img src={src} alt="" className="size-full object-cover" />
             </button>
           ))}
