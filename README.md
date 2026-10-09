@@ -154,7 +154,36 @@ npm run dev
 | `ORDER_TIMEOUT_MINUTES` | `15` | 同左。**改成 `1` 可以快速验证超时逻辑** |
 | `CRON_SECRET` | 随机值 | 随机值，和本地不同 |
 | `CRON_ENABLED` | `false` | 生产不用这个开关（它只管本地那个脚本） |
+| `STRIPE_SECRET_KEY` | Stripe 控制台的 `sk_test_...` | 同左（还是测试密钥，项目没上 live） |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Stripe 控制台的 `pk_test_...` | 同左 |
+| `STRIPE_WEBHOOK_SECRET` | `stripe listen` 打印的 `whsec_...`（见下） | Stripe 控制台「Webhook 端点」里那一个 |
 | `SEED_DEMO_USERS` | **不用配** | **不用配**（见下） |
+
+#### 本地要真的收到支付回调，得做两件事
+
+只跑 `stripe listen` 是**不够**的 —— 少了密钥，接口会以
+`not_configured` 拒绝处理（HTTP 500），而且一个字节都不写库：
+
+```bash
+# 1) 起转发（这个终端得一直开着）
+stripe listen --events payment_intent.succeeded \
+  --forward-to localhost:3000/api/webhooks/stripe
+
+# 2) 把上面打印出来的 whsec_... 填进 .env 的 STRIPE_WEBHOOK_SECRET，然后重启 dev server
+```
+
+两件都做了，付款后订单才会自己翻成「已支付」；
+只用测试卡（`4242 4242 4242 4242`）付完、不配这两样，
+**钱在 Stripe 那边是收到了，但订单会一直停在「待支付」**。
+
+> ⚠️ `stripe listen` **只转发新事件**。漏掉的历史事件不会自己补上 ——
+> 要补得用 `stripe events resend evt_xxx`（配上密钥之后）。
+>
+> ⚠️ CLI **登录的账号**必须和 `.env` 里的 `STRIPE_SECRET_KEY` 属于同一个账号。
+> 否则 `stripe listen` 转发的是另一个账号的测试事件，一条都到不了这里 ——
+> 界面上表现为「`stripe listen` 明明开着，webhook 却永远不触发」。
+> （实在不想切账号，可以在命令后加 `--api-key` 临时指定，但那样密钥就进了
+> shell 历史，不如直接 `stripe login`。）
 
 #### `SEED_DEMO_USERS`：演示账号种不种
 
@@ -883,9 +912,12 @@ are treated as aliases for 'verify-full'
 这是个学习项目，下面这些是**故意**没做的，不是漏了：
 
 - **支付接了 Stripe（PaymentIntent + webhook），但只有这一条链路。** 卡号由 Stripe
-  的收银台收、我们只拿 clientSecret；订单翻「已支付」靠 webhook 验签后的回调。
-  缺的是：退款没接 Stripe 退款 API（仍走手写审批）、没有对账、没有 3D Secure 之外
-  的支付方式验证、`stripe listen` 之外没有 webhook 重放/监控。
+  的收银台收、我们只拿 clientSecret；订单翻「已支付」主要靠 webhook 验签后的回调
+  （外加用户点「去支付」时那次补算，见下）。
+  缺的是：退款没接 Stripe 退款 API（仍走手写审批）、**没有定时对账**
+  （唯一的对账入口是用户再点一次「去支付」时顺手补的那一刀，见
+  `src/lib/stripe-payment.ts`）、没有 3D Secure 之外的支付方式验证、
+  `stripe listen` 之外没有 webhook 重放/监控。
   **结算货币是 USD，人民币按汇率换算后结算**（test mode 无实际影响，live 涉及汇率损益）。
 - **退款是「管理员审批 + 改状态」，没有真的退钱。** 买家提交退款单，管理员批准或驳回；
   批准时订单进 `REFUNDED`、库存还回去、用的券也退给买家。

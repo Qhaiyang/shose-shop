@@ -34,12 +34,16 @@ import {
  * 造一个 Stripe 假实例。
  *
  * create / retrieve 都返回一个带 client_secret 的对象，够 createPaymentIntentForOrder
- * 用就行。真实 SDK 返回的字段远不止这些，但函数只读 id 和 client_secret，
+ * 用就行。真实 SDK 返回的字段远不止这些，但函数只读 id / client_secret / status，
  * 其余一概不碰 —— 所以 mock 不用长成真的 PaymentIntent。
+ *
+ * 【status 为什么不给默认值】
+ * 不给的话 `pi.status` 是 undefined，于是「既不是 succeeded 也不是 canceled」——
+ * 正好是「普通复用」那一路。想让用例走终态分支，就显式传 status
  */
 function makeStripeMock(options?: {
   createResult?: { id?: string; client_secret?: string | null }
-  retrieveResult?: { id?: string; client_secret?: string | null }
+  retrieveResult?: { id?: string; client_secret?: string | null; status?: string }
 }) {
   const create = vi.fn().mockResolvedValue({
     id: "pi_mock_created",
@@ -116,6 +120,79 @@ describe("建 PaymentIntent：复用", () => {
     // 复用这条路的全部意义：**没有**新建第二个 PI
     expect(create).not.toHaveBeenCalled()
   })
+
+  // -------------------------------------------------------------------------
+  // 复用 · 但旧 PI 已经到终态
+  //
+  // 这两种状态都不能把 clientSecret 发给前端 —— 终态的 PI 初始化不了
+  // Elements，Stripe 会抛 loaderror。这一段钉的就是「别把死掉的 PI 交出去」
+  // -------------------------------------------------------------------------
+
+  it("旧 PI 已 succeeded 但订单还是待支付 → 对账成已支付，不吐 clientSecret、不建新 PI", async () => {
+    const { userId } = await makeShop()
+    const order = await makeOrder({ userId })
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { stripePaymentIntentId: "pi_already_paid" },
+    })
+
+    const { stripe, create, retrieve } = makeStripeMock({
+      retrieveResult: {
+        id: "pi_already_paid",
+        client_secret: "secret_of_a_dead_pi",
+        status: "succeeded",
+      },
+    })
+    const result = await createPaymentIntentForOrder(stripe, order.id, userId)
+
+    // 钱早就收了，这次调用做的是对账 —— 没有 clientSecret 可给
+    expect(result).toEqual({ ok: true, orderPaid: true })
+
+    // 订单真的被推成了已支付（走的是 webhook 那个 markOrderPaidFromStripe）
+    const saved = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      select: { status: true, paidAt: true, stripePaymentIntentId: true },
+    })
+    expect(saved.status).toBe(ORDER_STATUS.PAID)
+    expect(saved.paidAt).not.toBeNull()
+    expect(saved.stripePaymentIntentId).toBe("pi_already_paid")
+
+    expect(retrieve).toHaveBeenCalledWith("pi_already_paid")
+    // 【这条最要紧】绝不能新建 —— 那等于让用户为一个已经付过的订单再付一次
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it("旧 PI 已 canceled → 新建一个并把 id 覆盖过去（复用一个作废的 PI 没有意义）", async () => {
+    const { userId } = await makeShop()
+    const order = await makeOrder({ userId })
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { stripePaymentIntentId: "pi_old_canceled" },
+    })
+
+    const { stripe, create, retrieve } = makeStripeMock({
+      createResult: { id: "pi_fresh", client_secret: "secret_fresh" },
+      retrieveResult: {
+        id: "pi_old_canceled",
+        client_secret: "secret_of_a_canceled_pi",
+        status: "canceled",
+      },
+    })
+    const result = await createPaymentIntentForOrder(stripe, order.id, userId)
+
+    expect(result).toEqual({ ok: true, clientSecret: "secret_fresh" })
+    expect(retrieve).toHaveBeenCalledWith("pi_old_canceled")
+    expect(create).toHaveBeenCalledOnce()
+
+    // 新 PI 的 id 落库了 —— webhook 靠这一列找回订单，换不成功就等于丢单
+    const saved = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      select: { stripePaymentIntentId: true, status: true },
+    })
+    expect(saved.stripePaymentIntentId).toBe("pi_fresh")
+    // 新建 PI 不等于订单被推进 —— 订单还得等用户付完钱 + webhook 回来
+    expect(saved.status).toBe(ORDER_STATUS.PENDING_PAYMENT)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -156,6 +233,43 @@ describe("建 PaymentIntent：资格守卫", () => {
 
     expect(result).toEqual({ ok: false, error: "订单已取消，无法支付" })
     expect(create).not.toHaveBeenCalled()
+  })
+
+  // 「订单已取消」和「钱收了没有」是两件事。订单可能是在用户**付完之后**
+  // 才被超时扫描取消的 —— 那时候再说「订单已取消，无法支付」就是骗人：
+  // 钱真出去了，用户需要的是「去联系客服」
+  it("订单已取消、但 PI 已经 succeeded → 「请联系客服」，不擅自把订单改回去", async () => {
+    const { userId } = await makeShop()
+    const order = await makeOrder({ userId, status: ORDER_STATUS.CANCELLED })
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { stripePaymentIntentId: "pi_paid_then_cancelled" },
+    })
+
+    const { stripe, create, retrieve } = makeStripeMock({
+      retrieveResult: {
+        id: "pi_paid_then_cancelled",
+        client_secret: "secret",
+        status: "succeeded",
+      },
+    })
+    const result = await createPaymentIntentForOrder(stripe, order.id, userId)
+
+    expect(result).toEqual({
+      ok: false,
+      error: "支付已完成，但订单状态异常，请联系客服",
+    })
+    expect(retrieve).toHaveBeenCalledWith("pi_paid_then_cancelled")
+    expect(create).not.toHaveBeenCalled()
+
+    // 【这条是这条用例的重点】不做对账、不改状态。
+    // 「要不要给一张已取消的订单发货」是客服的决定，不是这行代码的
+    const saved = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      select: { status: true, paidAt: true },
+    })
+    expect(saved.status).toBe(ORDER_STATUS.CANCELLED)
+    expect(saved.paidAt).toBeNull()
   })
 
   it("已过支付时限 → 「订单已超过支付时限，请重新下单」", async () => {

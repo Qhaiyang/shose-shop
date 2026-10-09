@@ -83,6 +83,18 @@ export function PayButton({ orderId }: { orderId: string }) {
         return
       }
 
+      // 【orderPaid：钱早就收到了，服务端刚把订单对账成已支付】
+      // 这种时候没有 clientSecret 可弹、也不该弹收银台。这条路径存在的意义
+      // 就是「别让用户看到一句『支付失败』」—— 他明明付成功了。
+      // 刷新一下，页面上的徽章会跟着变成「已支付」
+      if ("orderPaid" in result) {
+        toast.success("支付已完成", {
+          description: "订单已更新为「已支付」",
+        })
+        router.refresh()
+        return
+      }
+
       // 拿到 clientSecret 就弹出收银台。订单状态此时仍是「待支付」，
       // 要等用户真的付了钱、webhook 回来，才翻成「已支付」
       setClientSecret(result.clientSecret)
@@ -158,6 +170,9 @@ function PaymentForm({ orderId }: { orderId: string }) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   // 卡已确认、正在等 webhook 翻订单状态。true 时把表单换成「确认中」面板
   const [confirming, setConfirming] = useState(false)
+  // 收银台自己没加载出来（Stripe 那边拒绝渲染这个 Element）。非 null 时
+  // 把整个表单换掉 —— 见下面 onLoadError 的注释
+  const [loadError, setLoadError] = useState<string | null>(null)
   // 轮询到头也没等到状态变化
   const [timedOut, setTimedOut] = useState(false)
   const router = useRouter()
@@ -187,16 +202,32 @@ function PaymentForm({ orderId }: { orderId: string }) {
     setSubmitting(true)
     setErrorMessage(null)
 
-    const { error } = await stripe.confirmPayment({
-      elements,
-      confirmParams: {
-        // 万一命中需要跳转的支付方式，就把它带回订单页
-        return_url: `${window.location.origin}/orders/${orderId}`,
-      },
-      // 卡支付（本地测试用的 4242）不需要跳转，确认完当场返回结果；
-      // 只有那些必须跳到发卡行页面的方式才会真的重定向
-      redirect: "if_required",
-    })
+    // 【为什么要 try：上面那个 if 拦不住「Element 没挂上」】
+    // useStripe()/useElements() 只要 <Elements> 的 provider 在就都非 null，
+    // 它们回答的是「有没有 provider」，不是「里面的 Element 挂成功了没有」。
+    // Element 加载失败时 confirmPayment 会**抛** IntegrationError
+    // （"elements should have a mounted Payment Element"），而不是返回
+    // error —— 不接住的话它就是一个未处理的 rejection，用户看不到任何提示。
+    // 正常路径下走不到这里（loadError 已经把表单换掉了），这是最后一道兜底
+    let error: { message?: string | undefined } | undefined
+
+    try {
+      const result = await stripe.confirmPayment({
+        elements,
+        confirmParams: {
+          // 万一命中需要跳转的支付方式，就把它带回订单页
+          return_url: `${window.location.origin}/orders/${orderId}`,
+        },
+        // 卡支付（本地测试用的 4242）不需要跳转，确认完当场返回结果；
+        // 只有那些必须跳到发卡行页面的方式才会真的重定向
+        redirect: "if_required",
+      })
+      error = result.error
+    } catch (thrown) {
+      setErrorMessage(thrown instanceof Error ? thrown.message : "支付失败，请重试")
+      setSubmitting(false)
+      return
+    }
 
     if (error) {
       // 卡被拒、CVC 错这类是「这一次没付成」，留在对话框里让用户重试，
@@ -259,9 +290,30 @@ function PaymentForm({ orderId }: { orderId: string }) {
     )
   }
 
+  // 【收银台没加载出来】
+  // 没有这一段的话，<PaymentElement> 加载失败会静默成一团空白：
+  // Stripe 只在控制台打一句 `Unhandled payment Element loaderror {}`
+  // （事件被它序列化成空对象，看不出原因），而「支付」按钮还杵在那儿 ——
+  // 用户一点就撞上 confirmPayment 的 IntegrationError。所以这里把整个表单
+  // 换掉：表单不在了，那个按钮也就不在了
+  if (loadError) {
+    return (
+      <div className="space-y-4">
+        <p className="text-sm text-destructive">
+          收银台没能加载出来：{loadError}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          关掉后重试一次；如果一直这样，请稍后再来或联系客服。
+        </p>
+      </div>
+    )
+  }
+
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
-      <PaymentElement />
+      <PaymentElement
+        onLoadError={({ error }) => setLoadError(error.message ?? "未知错误")}
+      />
       {errorMessage && (
         <p className="text-sm text-destructive">{errorMessage}</p>
       )}

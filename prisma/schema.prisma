@@ -173,7 +173,10 @@ model Order {
   // 【订单 → pi 这个方向拿来干什么】
   //   1. 复用它。用户点了两次「去支付」时，我们要 retrieve 出原来那个
   //      PaymentIntent 继续用，而不是新建一个 —— 新建的话这一列会被覆盖，
-  //      而旧的那个 PI 可能还活着，它日后成功支付的 webhook 就找不到归属了
+  //      而旧的那个 PI 可能还活着，它日后成功支付的 webhook 就找不到归属了。
+  //      唯一的例外是 retrieve 回来发现旧 PI 已经 canceled：它作废了、
+  //      钱一分没收、clientSecret 也初始化不了 Elements，这时才新建并
+  //      用条件更新把 id 换过去（见 src/lib/stripe-payment.ts）
   //   2. 从一张订单反查它的支付记录（对账、排查）
   //   3. @unique 顺带保证「一个 PaymentIntent 只属于一张订单」，
   //      万一哪天有人把同一个 pi 写到了两张订单上，数据库会当场拒绝
