@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { Geist, Geist_Mono } from "next/font/google"
 
+import { OrderChat } from "@/components/ai/order-chat"
 import { HeaderAuth } from "@/components/auth/header-auth"
 import { CartBadge } from "@/components/cart/cart-badge"
 import { CartSync } from "@/components/cart/cart-sync"
@@ -84,6 +85,11 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
             学习用项目 · 不产生真实交易
           </div>
         </footer>
+
+        {/* 订单助手悬浮球。只在登录后出现 —— 它要查的是「你的」订单，
+            没登录就没什么可查的。注意这道判断只是「不给用户添堵」，
+            真正的挡板在 action 里（Server Action 可以被直接 POST 调） */}
+        {user && <OrderChat />}
 
         {/* sonner 的 Toast 容器，全局挂一次即可，各处用 toast() 调用 */}
         <Toaster position="top-center" richColors />
