@@ -154,9 +154,9 @@ npm run dev
 | `ORDER_TIMEOUT_MINUTES` | `15` | 同左。**改成 `1` 可以快速验证超时逻辑** |
 | `CRON_SECRET` | 随机值 | 随机值，和本地不同 |
 | `CRON_ENABLED` | `false` | 生产不用这个开关（它只管本地那个脚本） |
-| `STRIPE_SECRET_KEY` | Stripe 控制台的 `sk_test_...` | 同左（还是测试密钥，项目没上 live） |
-| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Stripe 控制台的 `pk_test_...` | 同左 |
-| `STRIPE_WEBHOOK_SECRET` | `stripe listen` 打印的 `whsec_...`（见下） | Stripe 控制台「Webhook 端点」里那一个 |
+| `STRIPE_SECRET_KEY` | Stripe 控制台的 `sk_test_...` | —（本地开发用） |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | Stripe 控制台的 `pk_test_...` | —（本地开发用） |
+| `STRIPE_WEBHOOK_SECRET` | `stripe listen` 打印的 `whsec_...`（见下） | —（本地开发用） |
 | `SEED_DEMO_USERS` | **不用配** | **不用配**（见下） |
 
 #### 本地要真的收到支付回调，得做两件事
@@ -591,7 +591,7 @@ Server Action 编译后是一个独立的 POST 端点。客户端可以直接构
 
 ### 测试覆盖
 
-**650 条**，三层全绿：单元 343 / 集成 300 / E2E 7。跑法见「测试」一节，
+**653 条**，三层全绿：单元 343 / 集成 303 / E2E 7。跑法见「测试」一节，
 全跑一条命令：`npm run test`。
 
 ### 已部署
@@ -774,6 +774,8 @@ npm run db:reset -- --db=shoptest # 换成操作指定的库
 | `CRON_SECRET` | `/api/cron/expire-orders` 的 Bearer 令牌 |
 | `ORDER_TIMEOUT_MINUTES` | 订单超时自动取消的分钟数 |
 
+> ⚠️ 线上未配 Stripe 三个变量，支付链路在线上不可用（仅本地开发可走通）。
+
 **线上数据**：商品和 SKU 照种（3 款 / 48 个），优惠券也种（3 张），
 但**用户表是空的** —— 演示账号只在连本机库时才种（见「`SEED_DEMO_USERS`」一节）。
 所以线上第一个管理员要**自己注册、再手工提权**：
@@ -862,7 +864,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 ### 第 5 步：部署，然后灌演示商品数据（可选）
 
-点 Deploy。构建期间 `prisma migrate deploy` 会把 12 张表建出来。
+点 Deploy。构建期间 `prisma migrate deploy` 会把 13 张表建出来。
 
 想要线上有商品可看，就在**本地**跑一次种子（**一次性运维动作走直连最省事**）：
 
