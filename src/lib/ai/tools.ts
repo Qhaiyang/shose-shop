@@ -21,7 +21,7 @@ import { z } from "zod"
 import { orderStatusSchema } from "@/lib/constants"
 import { formatPrice } from "@/lib/format"
 import {
-  getOrderDetail,
+  getOrderDetailByNo,
   getOrdersByUser,
   type OrderDetail,
   type OrderSummary,
@@ -61,9 +61,10 @@ export type ListMyOrdersInput = z.infer<typeof listMyOrdersInput>
 
 /** 单个订单：只留模型和用户对话时用得上的字段 */
 export const orderForModelSchema = z.object({
-  /** 内部主键。下一轮 getOrderDetail 靠它精确定位那一单 */
-  id: z.string(),
-  /** 给人看的单号（SO2026...）。模型转述给用户时念这个，不是念 id */
+  /**
+   * 单号（SO2026...）。它同时是两样东西：说给用户听的，和下一轮
+   * 查详情时当把手的。**不给 id** —— 见下面 toModelOrder 的注释
+   */
   orderNo: z.string(),
   /** 中文状态标签，如「待付款」「已发货」 */
   status: z.string(),
@@ -81,9 +82,14 @@ const listMyOrdersOutput = z.object({ orders: z.array(orderForModelSchema) })
 /** 把领域对象压成「模型视角」的那几个字段 */
 function toModelOrder(order: OrderSummary) {
   return {
-    // id 和 orderNo 都给：id 是给模型当「把手」用的（下一轮调 getOrderDetail
-    // 时原样回传），orderNo 是给模型说给用户听的。两个用途，不能互相替代
-    id: order.id,
+    // 【为什么不给模型 id】
+    // getOrderDetail 改成按单号查之后，id 在这条链路上**一个消费者都没有**。
+    // 留着它，模型手上就有两个标识符、其中一个是废的，而「该用哪个」
+    // 只能靠 description 里一句话去教 —— 教不住的时候就是一次查不到，
+    // 而且它不会报错，只会礼貌地说「没找到这一单」。
+    //
+    // 这和 layout 里藏悬浮球、action 里照样验登录是同一条道理：
+    // 能靠结构让错误不可能发生，就别靠说明书去提醒。
     orderNo: order.orderNo,
     status: order.statusLabel,
     totalPrice: formatPrice(order.totalAmount),
@@ -108,6 +114,7 @@ export const listMyOrdersTool: AiTool = {
     "查询当前登录用户自己的订单列表，最新的在前。" +
     "当用户问「我的订单」「我买了什么」「我的单到哪了」「有几单还没付款」时调用。" +
     "只能查当前用户自己的订单，查不到别人的。" +
+    "返回里的 orderNo 就是查单笔详情要用的那个单号。" +
     "不要用它回答「某个单的具体明细」——那用 getOrderDetail。",
   parameters: z.toJSONSchema(listMyOrdersInput) as Record<string, unknown>,
 }
@@ -159,17 +166,26 @@ export async function executeListMyOrders(
 // ============================================================================
 // 5. getOrderDetail —— 输入 schema
 //
-// 只收一个 orderId，而且是**字符串**不是 number：
-// id 是 cuid（"clxyz..."），模型手上唯一的来源是 listMyOrders 的返回。
-// 它自己编一个也无所谓 —— 查出来必然是空，因为 where 里永远带着 userId。
+// 只收一个 orderNo。
+//
+// 【为什么是单号，不是 id】
+// 工具结果不跨轮留存：history 里只有人和助手说过的话。第一轮
+// listMyOrders 拿到的 id，到第二轮已经不在任何地方了 —— 模型手上
+// 只剩它自己上一条回复里念过的那个单号。
+//
+// 所以拿 id 当把手，注定是「模型只能编一个」；拿单号当把手，
+// 用户自己念得出来、模型转述得出来、上下轮都活得下来。
+// 这一条不是口味问题，是那个「追问寄到哪了 → 没找到这一单」的 bug 教出来的。
+//
+// 模型自己编一个单号也无所谓 —— 查出来必然是空，因为 where 里永远带着 userId。
 // ============================================================================
 
 export const getOrderDetailInput = z.object({
-  orderId: z
+  orderNo: z
     .string()
     .min(1)
     .describe(
-      "订单 id。必须原样使用 listMyOrders 返回的 id 字段，不要自己编造或改写",
+      "订单号，形如 SO20261009...。用 listMyOrders 返回里的 orderNo，或者用户自己说的那个单号；不要改写、不要编造",
     ),
 })
 
@@ -200,7 +216,7 @@ const orderItemForModelSchema = z.object({
 
 export const orderDetailForModelSchema = z.object({
   // 注意这里没有 id —— 详情是拿去「念给用户听」的，里面没有一个字段
-  // 是给模型当把手的；id 上一轮给它过了，再给一次只增加它抄错的概率
+  // 是给模型当把手的。单号已经在 listMyOrders 那一层给过它了
   orderNo: z.string(),
   status: z.string(),
   items: z.array(orderItemForModelSchema),
@@ -265,9 +281,10 @@ function toModelOrderDetail(order: OrderDetail) {
 // ============================================================================
 // 7. 工具声明
 //
-// description 里必须写清两件事：orderId 从哪来（上一轮 listMyOrders 的 id），
-// 以及「查不到」该怎么说。这两句不写，模型就会自己编 id、或者把 null
-// 解释成「系统出错」。工具失败信息写在哪，比工具做什么更容易被忽略。
+// description 里必须写清三件事：orderNo 从哪来（listMyOrders 的返回，
+// 或者用户自己说的）、手上没有单号时该先做什么、以及「查不到」该怎么说。
+// 这三句不写，模型就会自己编一个单号，或者把 null 解释成「系统出错」。
+// 工具失败信息写在哪，比工具做什么更容易被忽略。
 // ============================================================================
 
 export const getOrderDetailTool: AiTool = {
@@ -275,8 +292,9 @@ export const getOrderDetailTool: AiTool = {
   description:
     "查某一笔订单的完整详情：买了什么、金额构成、收货信息、备注、各节点时间。" +
     "当用户问「这单什么时候发的」「寄到哪」「为什么便宜了」「我备注写的什么」时调用。" +
-    "orderId 必须用 listMyOrders 返回的 id，先调 listMyOrders 拿到 id 再调这个。" +
-    "如果返回的 order 是 null，说明没找到这一单（id 不对，或不属于当前用户）——" +
+    "orderNo 用 listMyOrders 返回里的那个单号，或者用户自己说出来的单号。" +
+    "手上没有单号时，先调 listMyOrders 拿一个，不要凭空编。" +
+    "如果返回的 order 是 null，说明没找到这一单（单号不对，或不属于当前用户）——" +
     "直接告诉用户没找到，不要重试，也不要猜原因。" +
     "只能查当前用户自己的订单。",
   parameters: z.toJSONSchema(getOrderDetailInput) as Record<string, unknown>,
@@ -285,10 +303,10 @@ export const getOrderDetailTool: AiTool = {
 // ============================================================================
 // 8. 执行器
 //
-// 注意这里**没有**「id 不存在」和「id 属于别人」两个分支 ——
-// getOrderDetail 的 where 是 { id, userId }，两个 ? 合成同一个 null。
+// 注意这里**没有**「单号不存在」和「单号属于别人」两个分支 ——
+// getOrderDetailByNo 的 where 是 { orderNo, userId }，两种情况合成同一个 null。
 // 这不是偷懒，是刻意的：分开报错就等于给模型一个探测器，
-// 让它能问出「这个 id 存不存在」；而它对这两种情况的正确反应本来就一样。
+// 让它能问出「这个单号存不存在」；而它对这两种情况的正确反应本来就一样。
 // ============================================================================
 
 export async function executeGetOrderDetail(
@@ -302,7 +320,7 @@ export async function executeGetOrderDetail(
 
   let order: OrderDetail | null
   try {
-    order = await getOrderDetail(parsed.data.orderId, userId)
+    order = await getOrderDetailByNo(parsed.data.orderNo, userId)
   } catch (error) {
     console.error("[ai] getOrderDetail 查库失败", error)
     return { ok: false, error: "查询订单失败，请稍后再试" }

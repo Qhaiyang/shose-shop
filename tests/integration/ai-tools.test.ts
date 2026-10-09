@@ -41,7 +41,7 @@ function ordersOf(result: Awaited<ReturnType<typeof executeListMyOrders>>) {
 }
 
 describe("executeListMyOrders：输出是「给模型看的形状」", () => {
-  it("真实下单后，字段被压成六个，钱和时间都已经格式化好", async () => {
+  it("真实下单后，字段被压成五个，钱和时间都已经格式化好", async () => {
     const { userId, sku } = await makeShop({ price: 89900, stock: 10 })
     // 同一 SKU 买 3 件：种类数 1、总件数 3，用来区分这两个概念
     await addToCart(userId, sku.id, 3)
@@ -55,14 +55,12 @@ describe("executeListMyOrders：输出是「给模型看的形状」", () => {
     expect(orders).toHaveLength(1)
 
     const order = orders[0]
-    // 字段集合精确相等 —— 多一个（漏删内部字段）少一个（漏给模型）都要红
+    // 字段集合精确相等 —— 多一个（漏删内部字段）少一个（漏给模型）都要红。
+    // 这里盯着的就是「id 没有被偷偷放回来」：模型手上只能有一个把手，
+    // 而那个把手是 orderNo
     expect(Object.keys(order).sort()).toEqual(
-      ["id", "createdAt", "orderNo", "status", "totalPrice", "totalQuantity"].sort(),
+      ["createdAt", "orderNo", "status", "totalPrice", "totalQuantity"].sort(),
     )
-
-    // id 和 orderNo 是两个不同的东西，都在
-    expect(typeof order.id).toBe("string")
-    expect(order.id).not.toBe(order.orderNo)
 
     // 状态是中文标签，不是 PENDING_PAYMENT 这种枚举
     expect(order.status).toBe("待支付")
@@ -159,7 +157,9 @@ async function makeOrderForAi() {
     phone: PHONE,
   })
   if (!created.ok) throw new Error("下单失败，测试前置条件没搭起来")
-  return { userId, orderId: created.orderId }
+  // 给的是**单号**不是 id：工具结果不跨轮留存，模型下一轮手上只有单号。
+  // 这个测试夹具返回什么，就等于模型能拿到什么
+  return { userId, orderNo: created.orderNo }
 }
 
 function detailOf(result: Awaited<ReturnType<typeof executeGetOrderDetail>>) {
@@ -169,9 +169,9 @@ function detailOf(result: Awaited<ReturnType<typeof executeGetOrderDetail>>) {
 
 describe("executeGetOrderDetail：详情映射", () => {
   it("真实订单查出来是「详情形状」：金额已格式化、明细已展开、时间已转文本", async () => {
-    const { userId, orderId } = await makeOrderForAi()
+    const { userId, orderNo } = await makeOrderForAi()
 
-    const order = detailOf(await executeGetOrderDetail(userId, { orderId }))
+    const order = detailOf(await executeGetOrderDetail(userId, { orderNo }))
     expect(order).not.toBeNull()
     if (!order) return
 
@@ -222,9 +222,9 @@ describe("executeGetOrderDetail：详情映射", () => {
   })
 
   it("手机号打码后才给模型，完整号码一个字节都不出现", async () => {
-    const { userId, orderId } = await makeOrderForAi()
+    const { userId, orderNo } = await makeOrderForAi()
 
-    const result = await executeGetOrderDetail(userId, { orderId })
+    const result = await executeGetOrderDetail(userId, { orderNo })
     const order = detailOf(result)
 
     expect(order?.phone).toBe("138****8000")
@@ -234,30 +234,32 @@ describe("executeGetOrderDetail：详情映射", () => {
 })
 
 describe("executeGetOrderDetail：三种「查不到」的处理", () => {
-  it("id 不存在 → ok:true + order:null（不是 ok:false）", async () => {
+  it("单号不存在 → ok:true + order:null（不是 ok:false）", async () => {
     const { userId } = await makeShop()
 
-    const result = await executeGetOrderDetail(userId, { orderId: "no_such_id" })
+    const result = await executeGetOrderDetail(userId, {
+      orderNo: "SO-NOT-FOUND",
+    })
     expect(result.ok).toBe(true)
     expect(detailOf(result)).toBeNull()
   })
 
-  it("id 是别人的 → 和「id 不存在」返回的东西完全一致", async () => {
+  it("单号是别人的 → 和「单号不存在」返回的东西完全一致", async () => {
     const a = await makeOrderForAi()
     const b = await makeShop()
 
     const notFound = await executeGetOrderDetail(a.userId, {
-      orderId: "no_such_id",
+      orderNo: "SO-NOT-FOUND",
     })
-    const others = await executeGetOrderDetail(b.userId, { orderId: a.orderId })
+    const others = await executeGetOrderDetail(b.userId, { orderNo: a.orderNo })
 
-    // 逐字节相等：两者可区分，就等于给了模型一个「这个 id 存在吗」的探测器
+    // 逐字节相等：两者可区分，就等于给了模型一个「这个单号存在吗」的探测器
     expect(others).toEqual(notFound)
     expect(detailOf(others)).toBeNull()
   })
 
-  it("模型给的 orderId 不是字符串 → ok:false（这是模型的错，不是查不到）", async () => {
-    const result = await executeGetOrderDetail("u_whatever", { orderId: 123 })
+  it("模型给的 orderNo 不是字符串 → ok:false（这是模型的错，不是查不到）", async () => {
+    const result = await executeGetOrderDetail("u_whatever", { orderNo: 123 })
     expect(result.ok).toBe(false)
   })
 })

@@ -1479,6 +1479,37 @@ export async function getOrderDetail(
   return order ? toOrderDetail(order) : null
 }
 
+/**
+ * 按**订单号**查详情（用户视角）。
+ *
+ * 【为什么不复用上面那个 getOrderDetail，非要再写一个】
+ * 上面按主键 id 查，这个按 orderNo 查。差别看起来只有一个字段，
+ * 但它们的**调用方**活在两种不同的世界里：
+ *
+ *   - 页面：URL 里就是 id，id 全程在手上，按 id 查最直接
+ *   - AI 客服：工具结果**不跨轮留存**（history 只存人和助手说的话）。
+ *     第一轮 listMyOrders 拿到的 id，到第二轮已经不存在于任何地方了 ——
+ *     模型手上只剩它自己上一条回复里念过的那个单号。所以对模型来说，
+ *     **orderNo 才是那个能活过一轮的把手**。
+ *
+ * 【为什么把 userId 写进 where，而不是查出来再比对】
+ * 和 getOrderDetail 同一条理由，一个字都不改：写进 where 是从根上
+ * 杜绝「忘了判断」，if 判断是留给「忘了写 if」的机会。
+ * orderNo 有 @unique（全局唯一），加不加 userId 都能定位到唯一一行，
+ * 但加了之后，别人的单**根本查不出来**，而不是查出来再被拒绝。
+ */
+export async function getOrderDetailByNo(
+  orderNo: string,
+  userId: string,
+): Promise<OrderDetail | null> {
+  const order = await prisma.order.findFirst({
+    where: { orderNo, userId },
+    select: ORDER_DETAIL_SELECT,
+  })
+
+  return order ? toOrderDetail(order) : null
+}
+
 export type OrderDetailForAdmin = OrderDetail & {
   /** 买家信息。管理员要联系买家，所以这里必须带出来 */
   buyer: { id: string; name: string; email: string }
