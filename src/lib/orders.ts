@@ -589,13 +589,17 @@ export type PayOrderResult = { ok: true } | { ok: false; error: string }
 /**
  * 模拟支付：把订单从「待支付」推到「已支付」，并记录支付时间。
  *
+ * 【生产已不再调用】
+ * 支付已改由 Stripe webhook 驱动（见 src/lib/stripe-payment.ts）：
+ * 点按钮 → 建 PaymentIntent → 用户付款 → webhook 里 markOrderPaidFromStripe
+ * 翻状态。本函数保留为「模拟支付」原语，38 条集成测试仍依赖它
+ * （access-control / cancel-expired / state-machine / refunds / stripe-webhook）。
+ * 删除前请先确认这些测试的替代方案。
+ *
  * 【为什么叫「模拟」】
- * 没有接任何真实支付网关。真实流程应该是：
- *   下单 → 调支付平台拿支付链接/token → 用户在他们页面付款 →
- *   支付平台回调我们的 webhook → **在回调里**改状态
- * 关键区别：真实场景下**绝不能**由前端点一下就改状态，
- * 必须等支付平台的异步回调（而且要验签、要防重放）。
- * 这里为了学习订单状态机，用一次按钮点击代替整个回调链路。
+ * 真实流程里**绝不能**由前端点一下就改状态，必须等支付平台的异步回调
+ * （而且要验签、要防重放）。这里为了学习订单状态机，用一次按钮点击
+ * 代替整个回调链路。
  */
 export async function payOrder(
   orderId: string,

@@ -1,4 +1,6 @@
-import { expect, test } from "@playwright/test"
+import { expect, test, type Page } from "@playwright/test"
+
+import { paymentSucceededPayload, stripeSignatureHeader } from "./helpers/stripe"
 
 // ============================================================================
 // 订单备注 E2E：下单时写 → 详情页改/清空 → 管理员看到 → 发货后锁死
@@ -20,6 +22,31 @@ import { expect, test } from "@playwright/test"
 // ============================================================================
 
 const ADMIN = { email: "admin@shop.dev", password: "admin123" }
+
+/**
+ * 用「真实支付回调」把订单翻成「已支付」。
+ *
+ * 理由见 golden-path.spec.ts 里的同名 helper —— 走 /api/webhooks/stripe，
+ * 让真实的 webhook 链路翻状态，而不是直接改库。
+ */
+async function payOrderViaWebhook(page: Page, orderId: string) {
+  // payload 生成之后就不再动：签名和发出的 body 必须是同一串字符
+  const payload = paymentSucceededPayload(orderId)
+  const response = await page.request.post("/api/webhooks/stripe", {
+    headers: {
+      "stripe-signature": stripeSignatureHeader(payload),
+      "content-type": "application/json",
+    },
+    data: payload,
+  })
+
+  const body = await response.json()
+  if (response.status() !== 200 || body.outcome !== "applied") {
+    throw new Error(
+      `E2E 支付回调没有翻状态：HTTP ${response.status()} ${JSON.stringify(body)}`,
+    )
+  }
+}
 
 /** 结算页填的那句，后面要在订单详情页按它找 */
 const NOTE_AT_CHECKOUT = "请工作日送达，放门口快递柜就行"
@@ -87,6 +114,8 @@ test("下单写备注 → 详情页改 → 管理员看到 → 发货后锁定",
 
   // 记住用户自己那句备注留下的痕迹 —— 下面要反复看这一页
   const orderUrl = page.url()
+  // 订单 id 就在 URL 尾巴上，第 8 步造支付回调要用它当 metadata
+  const orderId = new URL(orderUrl).pathname.split("/").pop()!
 
   // ==========================================================================
   // 3. 下单后立刻能看到自己写的那句话
@@ -186,8 +215,10 @@ test("下单写备注 → 详情页改 → 管理员看到 → 发货后锁定",
   // 【为什么这一条值得单独走一遍】「发货前能改」在代码里是
   // PENDING_PAYMENT **和** PAID 两个状态。只测了待支付就以为发货前都能改，
   // 是很容易漏的一格 —— 而漏掉它的后果是：付完款发现写错地址备注却改不了
-  await page.getByRole("button", { name: "去支付" }).click()
-  await expect(page.getByText("支付成功", { exact: true })).toBeVisible()
+  //
+  // 【为什么不点「去支付」】那个按钮现在打开 Stripe 收银台，E2E 跑不了。
+  // 用真实 webhook 回调翻状态（理由见文件顶部 helper 的注释）
+  await payOrderViaWebhook(page, orderId)
   await page.reload()
 
   await expect(page.getByText("已支付", { exact: true })).toBeVisible()

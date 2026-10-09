@@ -328,6 +328,21 @@ export const LOW_STOCK_THRESHOLD = 5
  */
 export const MAX_PRICE_CENTS = 99_999_900
 
+/**
+ * Stripe 建 PaymentIntent 时用的货币代码。
+ *
+ * Stripe 账号结算货币是 USD，人民币按汇率换算后结算（test mode 无实际影响）。
+ * amount 单位是「分」，CNY 的最小单位恰好是分，所以 order.totalAmount 直接传，
+ * 不换算。
+ *
+ * 【为什么抽成常量】
+ * 这个字符串只在建 PI 那一处用，但它是「数字单位」的一部分 ——
+ * 一旦散落在 action 里，哪天有人想「顺手支持多币种」就会在另一处
+ * 写死一个 "usd"，两个地方各说各话。货币和「分」是绑在一起的语义，
+ * 收进常量才不会被漏改。
+ */
+export const STRIPE_CURRENCY = "cny"
+
 /** 调库存时单次增减的绝对值上限，和单个 SKU 调库存保持一致 */
 export const MAX_STOCK_DELTA = 999_999
 

@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test"
 
 import { loadEnv, urlForDatabase } from "./scripts/db-url.mjs"
+import { E2E_WEBHOOK_SECRET } from "./tests/e2e/helpers/stripe"
 
 // ============================================================================
 // Playwright 配置（第三层：端到端）
@@ -25,6 +26,20 @@ const E2E_DB = "shope2e"
 loadEnv()
 
 const e2eUrl = urlForDatabase(process.env.DATABASE_URL!, E2E_DB)
+
+// 【为什么除了 webServer.env，还要在这里改 process.env】
+// webServer.env 只作用于被拉起的 next dev 子进程；而 config 这个进程
+// （以及从它 fork 出去的 worker）有自己的环境变量 —— loadEnv() 把它设成了
+// .env 里的 shopdev。这两行把 config 进程也指向 E2E 库。
+//
+// 【它现在不是「spec 写库的依靠」了】
+// golden-path / order-note 以前直接 import prisma 翻订单状态，那时这一行
+// 是必需的。它们现在改走 HTTP webhook（见 tests/e2e/helpers/stripe.ts），
+// 已经不碰数据库。留着它纯属防御：万一将来某个 helper 在 config 进程里
+// 漏了库访问，至少落到 e2e 库、而不是开发库 shopdev。
+// （如果哪天要删，先确认 config 进程里真的没有 Prisma 引用。）
+process.env.DATABASE_URL = e2eUrl
+process.env.DIRECT_URL = e2eUrl
 
 // 【必须用 localhost，不能图省事写 127.0.0.1】
 // Next 16 的 dev server 会把「不是自己那个 origin」的 /_next/* 请求当成
@@ -109,6 +124,27 @@ export default defineConfig({
       // 就会被拒。给 E2E 换个 distDir，锁和编译缓存都各走各的，
       // 你那个 dev server 也不会被打断（见 next.config.ts 的注释）
       NEXT_DIST_DIR: ".next-e2e",
+
+      // 【为什么 E2E 也要 Stripe 的两个密钥】
+      // golden-path / order-note 的「支付」现在走**真实 webhook**
+      // （POST /api/webhooks/stripe），那条路由要 STRIPE_WEBHOOK_SECRET 验签、
+      // 要 STRIPE_SECRET_KEY 才能构造出 getStripe()。
+      //
+      // 【为什么用 ?? 而不是直接写死 dummy】
+      // 本地 .env 里有真的 sk_test_，stripe-checkout.spec.ts 要靠它建真 PI ——
+      // 所以真值优先，只有 CI（没有 .env）才吃 dummy。
+      // 两个 dummy 都只是「让代码能跑」，验签和构造都是纯本地计算，不校验值真假。
+      //
+      // 【为什么不改主进程的 process.env】
+      // 那是进程级的，会漏给同一进程里别的测试。webServer.env 只作用于
+      // 被拉起的这个 next dev 子进程，干净。
+      //
+      // 【webhook 密钥必须和 spec 里「签」用的那个一致】
+      // 两边都走同一条式子：.env 有就用 .env 的，没有就退回 E2E_WEBHOOK_SECRET。
+      // 本地 .env 目前没配它，所以两端都会落到同一个常量上。
+      STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? "sk_test_e2e_dummy",
+      STRIPE_WEBHOOK_SECRET:
+        process.env.STRIPE_WEBHOOK_SECRET ?? E2E_WEBHOOK_SECRET,
     },
   },
 })

@@ -8,11 +8,15 @@ import { checkoutSchema, orderNoteSchema } from "@/lib/schemas"
 import {
   confirmReceipt,
   createOrderFromCart,
-  payOrder,
   updateOrderNote,
   type TransitionOrderResult,
   type UpdateOrderNoteResult,
 } from "@/lib/orders"
+import { getStripe } from "@/lib/stripe"
+import {
+  createPaymentIntentForOrder,
+  type CreatePaymentIntentResult,
+} from "@/lib/stripe-payment"
 
 // ============================================================================
 // 下单 Server Action
@@ -112,30 +116,31 @@ export async function createOrderAction(
 }
 
 // ============================================================================
-// 模拟支付 Server Action
+// 创建支付意图 Server Action
 //
-// 【为什么不用 useActionState、也就不用 form action】
-// 支付没有表单字段要填，也不需要保留「上次的错误状态」——
-// 失败了弹个 toast 就够了，用户再点一次按钮即可。
-// 所以它收的是普通参数、返回普通对象，由客户端组件用 useTransition 调。
+// 【它和「模拟支付」是同一件差事的两个版本】
+// 模拟支付：点按钮 → 直接翻状态为「已支付」。那是练状态机用的原语，
+// 现在仍留在 lib 里给测试当模拟支付用，但生产已不再调它。
+// 真实支付（这个 action）：点按钮 → 建 PaymentIntent，把 clientSecret 给前端
+// 渲染出 Stripe 的收银台，用户填卡付款，**翻状态这件事等 webhook 回来再做**。
 //
-// 【为什么返回值里没有 redirect】
-// 支付成功后停在原页面最合适：用户能立刻看到状态从「待支付」变成「已支付」，
-// 比跳走更有反馈感。客户端拿到 ok: true 后 toast + router.refresh()，
-// 刷新会重新跑服务端组件，徽章就变色了。
+// 【为什么返回值里没有 redirect，也没有 revalidatePath】
+// 建 PaymentIntent 不改变任何订单状态 —— 状态还是「待支付」。
+// 真正把状态翻成「已支付」的是 webhook（见 src/lib/stripe-webhook.ts），
+// 那是一个独立的 HTTP 入口，跟这个 action 无关。所以这里成功之后
+// 服务端没有任何需要重新渲染的东西，返回 clientSecret 就够了。
 //
 // 【为什么 orderId 可以从客户端传】
-// 订单 id 不是秘密（用户本来就能在 URL 里看到），真正的防线是 payOrder 里
-// where 条件上的 userId —— 传别人的 id 只会得到 count=0。
-// 这和「不能信任客户端传来的价格」是两回事：
-// 价格是业务数据（被改了会亏钱），订单 id 只是个「我要操作哪一条」的定位符。
+// 和旧版同一个道理：订单 id 不是秘密（用户本来就能在 URL 里看到），
+// 真正的防线是 createPaymentIntentForOrder 里 where 条件上的 userId ——
+// 传别人的 id 只会查到 null。价格仍然一律不信客户端，从数据库读。
 // ============================================================================
 
-export type PayOrderActionResult = { ok: true } | { ok: false; error: string }
+export type CreatePaymentIntentActionResult = CreatePaymentIntentResult
 
-export async function payOrderAction(
+export async function createPaymentIntentAction(
   orderId: string,
-): Promise<PayOrderActionResult> {
+): Promise<CreatePaymentIntentActionResult> {
   if (typeof orderId !== "string" || orderId.length === 0) {
     return { ok: false, error: "订单参数不正确" }
   }
@@ -146,15 +151,9 @@ export async function payOrderAction(
     return { ok: false, error: "登录状态已失效，请重新登录" }
   }
 
-  const result = await payOrder(orderId, user.id)
-
-  if (result.ok) {
-    // 详情页的状态徽章、订单列表里那一条，都要重新查
-    revalidatePath(`/orders/${orderId}`)
-    revalidatePath("/orders")
-  }
-
-  return result
+  // getStripe() 在这里才建实例：缺密钥时抛错发生在「有人真的来付钱」
+  // 这一刻，而不是 import 或 build 阶段。理由见 src/lib/stripe.ts
+  return createPaymentIntentForOrder(getStripe(), orderId, user.id)
 }
 
 // ============================================================================
@@ -205,7 +204,7 @@ export async function confirmReceiptAction(
 // ============================================================================
 // 改订单备注 Server Action
 //
-// 【为什么它和 payOrderAction 长得一样，而不是用 useActionState】
+// 【为什么它和 confirmReceiptAction 长得一样，而不是用 useActionState】
 // 备注没有「保留用户输入重新显示」的需求 —— 失败时 textarea 里的字还在
 // 组件自己的 state 里，不需要服务端把它带回来。所以按普通参数收、
 // 返回普通对象，客户端用 useTransition 调。

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test"
 
+import { paymentSucceededPayload, stripeSignatureHeader } from "./helpers/stripe"
+
 // ============================================================================
 // 黄金路径 E2E：注册 → 搜索/筛选/排序 → 加购 → 下单 → 支付 → 发货 → 收货
 //
@@ -51,6 +53,42 @@ async function readAmount(page: Page, label: string): Promise<number> {
   const negative = text.trim().startsWith("-")
   const value = Number(text.replace(/[^\d.]/g, ""))
   return Math.round(value * 100) * (negative ? -1 : 1)
+}
+
+/**
+ * 用「真实支付回调」把订单翻成「已支付」，让后面的发货/收货/退款流程能继续。
+ *
+ * 【为什么走 webhook，而不是直接把 orders.status 改成 PAID】
+ * 直接改库只证明「状态字段能被写成 PAID」，绕过了整条支付链路。
+ * 走 webhook 则是：造一个签名合法的 payment_intent.succeeded，
+ * POST 到 /api/webhooks/stripe，让 route 验签 → 丢给
+ * markOrderPaidFromStripe 去翻状态 —— 也就是生产环境里真实发生的那条路。
+ * 唯一的区别只是没经过浏览器里的 Stripe 收银台（那要真银行卡，
+ * 归 stripe-checkout.spec.ts 管）。
+ *
+ * 【为什么是 POST 而不是调 markOrderPaidFromStripe】
+ * spec 跑在 Playwright 的 worker 进程里，会被转成 CommonJS 执行，而生成的
+ * Prisma client 里有 `import.meta.url` —— CJS 里那是语法错误（见 db-url.mjs
+ * 顶部的记录）。走 HTTP 就绕开了「spec 里直接碰 Prisma」这件事。
+ */
+async function payOrderViaWebhook(page: Page, orderId: string) {
+  // payload 在这里生成之后就不再动它：签名和发出的 body 必须是同一串字符
+  const payload = paymentSucceededPayload(orderId)
+  const response = await page.request.post("/api/webhooks/stripe", {
+    headers: {
+      "stripe-signature": stripeSignatureHeader(payload),
+      "content-type": "application/json",
+    },
+    // 传字符串 = 原样发送，Playwright 不会替我们再序列化一遍
+    data: payload,
+  })
+
+  const body = await response.json()
+  if (response.status() !== 200 || body.outcome !== "applied") {
+    throw new Error(
+      `E2E 支付回调没有翻状态：HTTP ${response.status()} ${JSON.stringify(body)}`,
+    )
+  }
 }
 
 test("注册 → 搜索/筛选/排序 → 加购 → 下单 → 支付 → 发货 → 确认收货", async ({
@@ -226,6 +264,9 @@ test("注册 → 搜索/筛选/排序 → 加购 → 下单 → 支付 → 发�
     await page.locator("text=/^SO\\d+$/").first().innerText()
   ).trim()
 
+  // 订单 id 就在 URL 尾巴上，后面造支付回调要用它当 metadata
+  const orderId = new URL(page.url()).pathname.split("/").pop()!
+
   // ==========================================================================
   // 4b. 订单详情上的「原价 / 优惠 / 实付」
   // ==========================================================================
@@ -246,13 +287,13 @@ test("注册 → 搜索/筛选/排序 → 加购 → 下单 → 支付 → 发�
   expect(await readAmount(page, "实付")).toBe(itemsTotal - COUPON.discount)
 
   // ==========================================================================
-  // 5. 支付（模拟支付）
+  // 5. 支付（真实 webhook 回调，只是不经过浏览器里的收银台）
   // ==========================================================================
-  await expect(page.getByRole("button", { name: "去支付" })).toBeVisible()
-  await page.getByRole("button", { name: "去支付" }).click()
-  await expect(page.getByText("支付成功", { exact: true })).toBeVisible()
+  // 【为什么这一格走 webhook，而不是直接改库】
+  // 见 payOrderViaWebhook 的注释：走 webhook 才让「支付 → 发货 → 收货」
+  // 这条链真的接上，只是把「填卡付款」那一步交给 Stripe 的测试环境去发生。
+  await payOrderViaWebhook(page, orderId)
 
-  // 刷新一次，确认状态是真的落到数据库了，而不是只改了前端的乐观状态
   await page.reload()
   await expect(page.getByText("已支付", { exact: true })).toBeVisible()
   // 还没发货，不该出现确认收货按钮
